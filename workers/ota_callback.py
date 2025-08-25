@@ -7,6 +7,8 @@ from models import (
     OtaCallbackJob, OtaCallbackAttempt, OtaCallbackJobStatus,
 )
 from retry_policy import jittered_offset, RETRY_SCHEDULE_OFFSETS
+from datetime import datetime
+
 
 async def _post_callback(url: str, body: dict, headers: dict):
     async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
