@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, select
 
 from db import get_db
+import db
 from models import (
     Order, OrderItem, Partner, PartnerStatus,
     IdempotencyKey, PipelineStatus,
@@ -16,6 +17,7 @@ from workers.ticketing import process_ticketing
 
 import ipaddress, socket
 from urllib.parse import urlparse
+from fastapi.responses import RedirectResponse
 
 load_dotenv()
 
@@ -36,6 +38,11 @@ async def health():
         "status": f"{APP_NAME} is healthy",
         "timestamp": datetime.now(bangkok_timezone).strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse("/docs", status_code=307)
+
 
 # ---------------- Helpers: csv/ip/ssrf ----------------
 def _csv_set(raw: str | None) -> Set[str]:
@@ -169,7 +176,7 @@ async def create_order(
 
     # Inbound idempotency
     if idempotency_key:
-        match = db.get(IdempotencyKey, {"partner_id": partner.partner_id, "key": idempotency_key})
+        match = db.get(IdempotencyKey, (partner.partner_id, idempotency_key))
         if match:
             existing = db.get(Order, match.order_id)
             if existing:
