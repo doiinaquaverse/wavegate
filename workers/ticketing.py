@@ -8,7 +8,7 @@ from models import (
     TicketingJob, TicketingAttempt, TicketingJobStatus,
     OtaCallbackJob,
 )
-from services.ticketing_format import build_soraso_payload
+from services.ticketing_format import build_ticketing_payload
 from retry_policy import jittered_offset, RETRY_SCHEDULE_OFFSETS
 
 FORWARDING_PAYLOAD_URL = os.getenv("FORWARDING_PAYLOAD_URL", "").strip()
@@ -40,7 +40,7 @@ async def process_ticketing(order_id: int):
             job = TicketingJob(
                 order_id=order.id,
                 trace_id=order.trace_id,
-                request_payload=build_soraso_payload(order),
+                request_payload=build_ticketing_payload(order),
                 status=TicketingJobStatus.queued,
             )
             db.add(job); db.commit(); db.refresh(job)
