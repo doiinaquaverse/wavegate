@@ -1,4 +1,6 @@
-import os, asyncio, time
+# workers/ota_callback.py
+import asyncio, time
+from datetime import datetime
 import httpx
 from sqlalchemy import func
 from db import SessionLocal
@@ -7,8 +9,6 @@ from models import (
     OtaCallbackJob, OtaCallbackAttempt, OtaCallbackJobStatus,
 )
 from retry_policy import jittered_offset, RETRY_SCHEDULE_OFFSETS
-from datetime import datetime
-
 
 async def _post_callback(url: str, body: dict, headers: dict):
     async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
@@ -34,7 +34,7 @@ async def process_ota_callback(order_id: int):
                 order_id=order.id,
                 trace_id=order.trace_id,
                 callback_url=order.ota_callback_url,
-                request_payload={},  # we fill just before sending
+                request_payload=order.raw_ota_payload,  # OTA's original payload
                 status=OtaCallbackJobStatus.pending,
             )
             db.add(job)
@@ -45,7 +45,7 @@ async def process_ota_callback(order_id: int):
             "Content-Type": "application/json",
             "X-Trace-Id": order.trace_id,
             "X-Origin-Partner-Id": order.partner_id,
-            "X-External-Order-Id": order.external_order_id,
+            "X-External-Order-Id": order.order_id,
             "Idempotency-Key": order.trace_id,
         }
 
@@ -54,19 +54,18 @@ async def process_ota_callback(order_id: int):
             if sleep_s:
                 await asyncio.sleep(sleep_s)
 
-            # Prepare body each time (include current timestamp)
-            body = {
-                "external_order_id": order.external_order_id,
+            # Prepare response body for OTA (what we will send back)
+            response_body = {
+                "order_id": order.order_id,
                 "status": "ticketed",
-                "order_id": order.id,
                 "trace_id": order.trace_id,
-                "ticketing_order_ref": order.ticketing_order_ref,
-                "customer_email": order.customer_email,
+                "customer_emails": order.customer_email,
                 "at": datetime.utcnow().isoformat() + "Z",
             }
+
             code, text = None, ""
             try:
-                code, text = await _post_callback(order.ota_callback_url, body, headers)
+                code, text = await _post_callback(order.ota_callback_url, response_body, headers)
             except Exception as e:
                 text = str(e)[:2000]
 
@@ -84,13 +83,15 @@ async def process_ota_callback(order_id: int):
             job.last_error = None if (code and 200 <= code < 300) else (text or "")[:2000]
             job.last_attempt_at = func.now()
             job.status = OtaCallbackJobStatus.in_progress
-            job.request_payload = body
+            job.request_payload = order.raw_ota_payload          # as requested
+            job.response_payload = response_body                 # what we send back
             db.commit()
 
             if code and 200 <= code < 300:
                 order = db.get(Order, order_id)
                 order.pipeline_status = PipelineStatus.ota_callback_delivered
                 job.status = OtaCallbackJobStatus.delivered
+                job.delivered_at = func.now()
                 db.commit()
                 return
 

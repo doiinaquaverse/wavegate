@@ -2,103 +2,74 @@
 from __future__ import annotations
 from typing import Any
 
-ALLOWED_TRIGGER_TYPES = {"ecomm_new_order", "ecomm_order_changed"}
-
 def _as_str_minor(v: Any) -> str:
     try:
         return str(int(v))
     except Exception:
         return "0"
 
-def _items_from_db(order_row) -> list[dict]:
-    items = []
-    for it in (order_row.items or []):
-        items.append({
-            "Count": it.quantity or 1,
-            "RowTotal": {
-                "Unit": order_row.currency or "THB",
-                "Value": _as_str_minor(it.line_total_minor or it.unit_price_minor or 0),
-            },
-            "ProductId": it.product_id,
-            "ProductName": it.product_name or "",
-        })
-    return items
-
-def build_ticketing_payload(order_row) -> dict:
+def build_soraso_payload(order_row) -> dict:
     """
-    Outbound shape:
+    Soraso format (per spec):
     {
-      "TriggerType": "ecomm_new_order" | "ecomm_order_changed",
+      "TriggerType": "ecomm_order_changed",
       "Payload": {
-        "OrderId": "...",
+        "OrderId": orders.order_id,
         "Status": "unfulfilled",
-        "CustomerInfo": {"FullName": "...", "Email": "..."},
-        "Totals": {"Total": {"Unit": "THB", "Value": "2761"}},
-        "PurchasedItems": [ ... ],
-        "PurchasedItemsCount": N
+        "accepted_at": "...",
+        "FulfilledOn": null,
+        "CustomerPaid": {"Unit":"...", "Value":"...", "String":"Unit Value"},
+        "CustomerInfo": {"FullName":"...", "Email":"..."},
+        "PurchasedItems": [
+          {"Count": n, "ProductId":"...", "ProductName":"...", "VariantId":"...",
+           "Price": {"Unit":"...", "Value":"...", "String":"..."}}
+        ],
+        "payment": {"processor":"...", "method":"...", "details": {...}}
       }
     }
-    - If inbound raw payload already has TriggerType/Payload, we keep TriggerType
-      only if it's allowed; else default to "ecomm_new_order".
-    - We always force Payload.Status = "unfulfilled" (tickets not generated yet).
     """
-    src = order_row.raw_ota_payload or {}
+    items = []
+    for it in (order_row.items or []):
+        unit = it.currency or order_row.currency or "THB"
+        val = _as_str_minor(it.unit_price or 0)
+        items.append({
+            "Count": it.quantity or 1,
+            "ProductId": it.product_id,
+            "ProductName": it.product_name or "",
+            "VariantId": it.variant_id,
+            "Price": {
+                "Unit": unit,
+                "Value": val,
+                "String": f"{unit} {val}",
+            },
+        })
 
-    # If inbound is already wrapped, normalize & enforce expectations
-    if isinstance(src, dict) and "TriggerType" in src and "Payload" in src:
-        trig = str(src.get("TriggerType") or "").strip()
-        trigger_type = trig if trig in ALLOWED_TRIGGER_TYPES else "ecomm_new_order"
+    # accepted_at from raw OTA (if present)
+    accepted_at = None
+    try:
+        accepted_at = (order_row.raw_ota_payload.get("order") or {}).get("accepted_at")
+    except Exception:
+        accepted_at = None
 
-        out = {
-            "TriggerType": trigger_type,
-            "Payload": dict(src.get("Payload") or {}),
-        }
-        pl = out["Payload"]
-
-        # Required fields
-        pl["OrderId"] = pl.get("OrderId") or order_row.external_order_id
-        pl["Status"] = "unfulfilled"
-
-        # Customer info (best effort fill)
-        ci = dict(pl.get("CustomerInfo") or {})
-        ci.setdefault("FullName", order_row.customer_name)
-        ci.setdefault("Email", order_row.customer_email)
-        pl["CustomerInfo"] = ci
-
-        # Items (only if missing)
-        if not pl.get("PurchasedItems"):
-            items = _items_from_db(order_row)
-            if items:
-                pl["PurchasedItems"] = items
-                pl["PurchasedItemsCount"] = len(items)
-
-        # Totals (best effort)
-        totals = dict(pl.get("Totals") or {})
-        if not totals.get("Total"):
-            totals["Total"] = {
-                "Unit": order_row.currency or "THB",
-                "Value": _as_str_minor(order_row.total_amount_minor or 0),
-            }
-        pl["Totals"] = totals
-
-        return out
-
-    # Construct minimal wrapped payload from DB fields
-    items = _items_from_db(order_row)
     payload = {
-        "OrderId": order_row.external_order_id,
+        "OrderId": order_row.order_id,
         "Status": "unfulfilled",
+        "accepted_at": accepted_at,
+        "FulfilledOn": None,
+        "CustomerPaid": {
+            "Unit": order_row.currency or "THB",
+            "Value": _as_str_minor(order_row.total_amount or 0),
+            "String": f"{order_row.currency or 'THB'} {_as_str_minor(order_row.total_amount or 0)}",
+        },
         "CustomerInfo": {
             "FullName": order_row.customer_name,
             "Email": order_row.customer_email,
         },
-        "Totals": {
-            "Total": {
-                "Unit": order_row.currency or "THB",
-                "Value": _as_str_minor(order_row.total_amount_minor or 0),
-            }
-        },
         "PurchasedItems": items,
-        "PurchasedItemsCount": len(items),
+        "payment": {
+            "processor": order_row.payment_processor,
+            "method": order_row.payment_method,
+            "details": order_row.payment_details or {},
+        },
     }
-    return {"TriggerType": "ecomm_new_order", "Payload": payload}
+    return {"TriggerType": "ecomm_order_changed", "Payload": payload}

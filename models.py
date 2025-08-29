@@ -21,32 +21,31 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from db import Base
 
-
 # ---------------- Enums ----------------
 
 class PartnerStatus(enum.Enum):
     active = "active"
-    inactive = "inactive"
-
+    terminated = "terminated"
 
 class PipelineStatus(enum.Enum):
-    # Retry-forever friendly stages (until success) with permanent blocks on 4xx
-    accepted = "accepted"                         # validated & persisted; ticketing job queued
-    ticketing_processing = "ticketing_processing" # (re)trying ticketing
-    ticketed = "ticketed"                         # ticketing 2xx (tickets created/emailed)
-    ota_callback_pending = "ota_callback_pending" # preparing/sending OTA callback
-    ota_callback_delivered = "ota_callback_delivered"  # OTA callback 2xx (done)
-    ticketing_blocked = "ticketing_blocked"       # ticketing 4xx → stop until manual fix
-    ota_callback_blocked = "ota_callback_blocked" # OTA 4xx → stop until manual fix
+    accepted = "accepted"
+    ticketing_processing = "ticketing_processing"
+    ticketed = "ticketed"
+    ota_callback_pending = "ota_callback_pending"
+    ota_callback_delivered = "ota_callback_delivered"
+    ticketing_blocked = "ticketing_blocked"
+    ota_callback_blocked = "ota_callback_blocked"
 
+class FulfillmentStatus(enum.Enum):
+    unfulfilled = "unfulfilled"
+    fulfilled = "fulfilled"
 
 class TicketingJobStatus(enum.Enum):
     queued = "queued"
     in_progress = "in_progress"
     ticketed = "ticketed"
     client_error = "client_error"
-    exhausted = "exhausted"  # used all scheduled attempts without success
-
+    exhausted = "exhausted"
 
 class OtaCallbackJobStatus(enum.Enum):
     pending = "pending"
@@ -55,13 +54,11 @@ class OtaCallbackJobStatus(enum.Enum):
     client_error = "client_error"
     exhausted = "exhausted"
 
-
 class AuthFailReason(enum.Enum):
-    no_partner = "no_partner"   # partner_id not found
-    inactive = "inactive"       # partner exists but not active
-    bad_token = "bad_token"     # token mismatch
-    ip_block = "ip_block"       # source IP not in allowlist
-
+    no_partner = "no_partner"
+    inactive = "inactive"
+    bad_token = "bad_token"
+    ip_block = "ip_block"
 
 # ---------------- Partners ----------------
 
@@ -77,6 +74,7 @@ class Partner(Base):
         default=PartnerStatus.active,
         nullable=False,
     )
+    webhook: Mapped[Optional[str]] = mapped_column(Text)  # optional default webhook from registration
     created_at: Mapped[str] = mapped_column(
         TIMESTAMP(timezone=True),
         server_default=func.now(),
@@ -86,20 +84,19 @@ class Partner(Base):
     allowlist_domains: Mapped[Optional[str]] = mapped_column(Text)
     allowlist_source_cidrs: Mapped[Optional[str]] = mapped_column(Text)
 
-
 # ---------------- Orders ----------------
 
 class Order(Base):
     __tablename__ = "orders"
     __table_args__ = (
-        UniqueConstraint("partner_id", "external_order_id", name="uq_partner_external_order"),
+        UniqueConstraint("partner_id", "order_id", name="uq_partner_external_order"),
         Index("ix_orders_pipeline_status_created_at", "pipeline_status", "created_at"),
     )
 
     # Internal identity & tracing
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     trace_id: Mapped[str] = mapped_column(
-        String(36),
+        String(128),
         unique=True,
         nullable=False,
         default=lambda: str(uuid.uuid4()),
@@ -113,7 +110,7 @@ class Order(Base):
         nullable=False,
         index=True,
     )
-    external_order_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    order_id: Mapped[str] = mapped_column(String(200), nullable=False)  # OTA's order id
     ota_callback_url: Mapped[str] = mapped_column(Text, nullable=False)
 
     # Raw inbound payload (audit ground truth)
@@ -121,19 +118,26 @@ class Order(Base):
 
     # Denormalized business snapshot
     currency: Mapped[Optional[str]] = mapped_column(String(10), default="THB")
-    total_amount_minor: Mapped[Optional[int]] = mapped_column(BigInteger)
+    total_amount: Mapped[Optional[int]] = mapped_column(BigInteger)
     customer_name: Mapped[Optional[str]] = mapped_column(String(255))
     customer_email: Mapped[Optional[str]] = mapped_column(String(320), index=True)
 
-    # Pipeline status
+    # Pipeline & fulfillment
     pipeline_status: Mapped[PipelineStatus] = mapped_column(
         Enum(PipelineStatus, native_enum=False),
         default=PipelineStatus.accepted,
         nullable=False,
         index=True,
     )
+    fulfillment_status: Mapped[FulfillmentStatus] = mapped_column(
+        Enum(FulfillmentStatus, native_enum=False),
+        default=FulfillmentStatus.unfulfilled,
+        nullable=False,
+        index=True,
+    )
+    fulfilled_at: Mapped[Optional[str]] = mapped_column(TIMESTAMP(timezone=True))
 
-    # Ticketing success snapshot (populated after 2xx from ticketing)
+    # Ticketing success snapshot
     ticketing_order_ref: Mapped[Optional[str]] = mapped_column(String(200))
     ticketing_response_snapshot: Mapped[Optional[dict]] = mapped_column(JSON)
 
@@ -141,6 +145,11 @@ class Order(Base):
     blocked_code: Mapped[Optional[int]] = mapped_column(Integer)
     blocked_reason: Mapped[Optional[str]] = mapped_column(Text)
     blocked_at: Mapped[Optional[str]] = mapped_column(TIMESTAMP(timezone=True))
+
+    # Payment
+    payment_processor: Mapped[Optional[str]] = mapped_column(String(100))
+    payment_method: Mapped[Optional[str]] = mapped_column(String(100))
+    payment_details: Mapped[Optional[dict]] = mapped_column(JSON)
 
     # Timestamps
     created_at: Mapped[str] = mapped_column(
@@ -177,7 +186,6 @@ class Order(Base):
         lazy="selectin",
     )
 
-
 # ---------------- OrderItems ----------------
 
 class OrderItem(Base):
@@ -195,14 +203,17 @@ class OrderItem(Base):
         nullable=False,
     )
 
+    trace_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
     line_no: Mapped[Optional[int]] = mapped_column(Integer)
 
     product_id: Mapped[Optional[str]] = mapped_column(String(200))
     product_name: Mapped[Optional[str]] = mapped_column(Text)
+    variant_id: Mapped[Optional[str]] = mapped_column(String(200))
+    variant_name: Mapped[Optional[str]] = mapped_column(Text)
 
-    unit_price_minor: Mapped[Optional[int]] = mapped_column(BigInteger)
+    unit_price: Mapped[Optional[int]] = mapped_column(BigInteger)  # minor units
+    currency: Mapped[Optional[str]] = mapped_column(String(10))
     quantity: Mapped[Optional[int]] = mapped_column(Integer)
-    line_total_minor: Mapped[Optional[int]] = mapped_column(BigInteger)
 
     meta: Mapped[Optional[dict]] = mapped_column(JSON)
 
@@ -214,7 +225,6 @@ class OrderItem(Base):
 
     # back reference to Order
     order: Mapped["Order"] = relationship(back_populates="items")
-
 
 # ---------------- TicketingJobs ----------------
 
@@ -234,7 +244,7 @@ class TicketingJob(Base):
         nullable=False,
     )
 
-    trace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    trace_id: Mapped[str] = mapped_column(String(128), nullable=False)
 
     request_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     response_payload: Mapped[Optional[dict]] = mapped_column(JSON)
@@ -272,7 +282,6 @@ class TicketingJob(Base):
         lazy="selectin",
     )
 
-
 # ---------------- TicketingAttempts ----------------
 
 class TicketingAttempt(Base):
@@ -291,7 +300,7 @@ class TicketingAttempt(Base):
         nullable=False,
     )
 
-    trace_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    trace_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
 
     attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
     status_code: Mapped[Optional[int]] = mapped_column(Integer)
@@ -306,7 +315,6 @@ class TicketingAttempt(Base):
 
     # backref to the job
     ticketing_job: Mapped["TicketingJob"] = relationship(back_populates="attempts")
-
 
 # ---------------- OtaCallbackJobs ----------------
 
@@ -325,7 +333,7 @@ class OtaCallbackJob(Base):
         nullable=False,
     )
 
-    trace_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    trace_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
 
     callback_url: Mapped[str] = mapped_column(Text, nullable=False)
 
@@ -335,6 +343,7 @@ class OtaCallbackJob(Base):
     last_status_code: Mapped[Optional[int]] = mapped_column(Integer)
     last_error: Mapped[Optional[str]] = mapped_column(Text)
     last_attempt_at: Mapped[Optional[str]] = mapped_column(TIMESTAMP(timezone=True))
+    delivered_at: Mapped[Optional[str]] = mapped_column(TIMESTAMP(timezone=True))
 
     status: Mapped[OtaCallbackJobStatus] = mapped_column(
         Enum(OtaCallbackJobStatus, native_enum=False),
@@ -365,7 +374,6 @@ class OtaCallbackJob(Base):
         lazy="selectin",
     )
 
-
 # ---------------- OtaCallbackAttempts ----------------
 
 class OtaCallbackAttempt(Base):
@@ -384,7 +392,7 @@ class OtaCallbackAttempt(Base):
         nullable=False,
     )
 
-    trace_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    trace_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
 
     attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
     status_code: Mapped[Optional[int]] = mapped_column(Integer)
@@ -400,7 +408,6 @@ class OtaCallbackAttempt(Base):
     # backref to the job
     ota_callback_job: Mapped["OtaCallbackJob"] = relationship(back_populates="attempts")
 
-
 # ---------------- IdempotencyKeys ----------------
 
 class IdempotencyKey(Base):
@@ -410,7 +417,6 @@ class IdempotencyKey(Base):
         Index("ix_idempotency_keys_created_at", "created_at"),
     )
 
-    # Composite primary key: (partner_id, key)
     partner_id: Mapped[str] = mapped_column(
         String(100),
         ForeignKey("partners.partner_id", onupdate="RESTRICT", ondelete="RESTRICT"),
@@ -424,6 +430,8 @@ class IdempotencyKey(Base):
         nullable=False,
     )
 
+    trace_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
+
     created_at: Mapped[str] = mapped_column(
         TIMESTAMP(timezone=True),
         server_default=func.now(),
@@ -432,7 +440,6 @@ class IdempotencyKey(Base):
 
     # optional ORM convenience
     order: Mapped["Order"] = relationship(back_populates="idempotency_keys")
-
 
 # ---------------- AuthEvents ----------------
 
@@ -446,7 +453,6 @@ class AuthEvent(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
-    # Claimed partner id from headers; no FK so we can log unknown partners
     partner_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
 
     ip: Mapped[Optional[str]] = mapped_column(String(64))
@@ -461,3 +467,44 @@ class AuthEvent(Base):
         server_default=func.now(),
         nullable=False,
     )
+
+# ---------------- Partner Registrations ----------------
+
+class PartnerRegistration(Base):
+    __tablename__ = "partners_registration"
+    __table_args__ = (
+        Index("ix_partners_registration_company", "company"),
+        Index("ix_partners_registration_contact_email", "contactEmail"),
+        Index("ix_partners_registration_created_at", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+
+    reference: Mapped[Optional[str]] = mapped_column(String(255))
+    company: Mapped[Optional[str]] = mapped_column(String(255))
+    website: Mapped[Optional[str]] = mapped_column(Text)
+    country: Mapped[Optional[str]] = mapped_column(String(64))
+    address: Mapped[Optional[str]] = mapped_column(Text)
+    taxId: Mapped[Optional[str]] = mapped_column(String(128))
+    contactName: Mapped[Optional[str]] = mapped_column(String(255))
+    contactEmail: Mapped[Optional[str]] = mapped_column(String(320))
+    contactPhone: Mapped[Optional[str]] = mapped_column(String(128))
+    techName: Mapped[Optional[str]] = mapped_column(String(255))
+    techEmail: Mapped[Optional[str]] = mapped_column(String(320))
+    techPhone: Mapped[Optional[str]] = mapped_column(String(128))
+    vol: Mapped[Optional[str]] = mapped_column(String(128))
+    rps: Mapped[Optional[str]] = mapped_column(String(128))
+    launch: Mapped[Optional[str]] = mapped_column(String(128))
+    tz: Mapped[Optional[str]] = mapped_column(String(64))
+    desc: Mapped[Optional[str]] = mapped_column(Text)
+    auth: Mapped[Optional[str]] = mapped_column(String(64))
+    env: Mapped[Optional[str]] = mapped_column(String(64))
+    webhook: Mapped[Optional[str]] = mapped_column(Text)
+    ips: Mapped[Optional[str]] = mapped_column(Text)
+    arch: Mapped[Optional[str]] = mapped_column(Text)
+    demo: Mapped[Optional[str]] = mapped_column(Text)
+    usecase: Mapped[Optional[list]] = mapped_column(JSON)
+    compliance: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    raw: Mapped[Optional[dict]] = mapped_column(JSON)  # full original payload

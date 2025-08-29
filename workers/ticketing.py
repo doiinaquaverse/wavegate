@@ -1,3 +1,4 @@
+# workers/ticketing.py
 import os, asyncio, time
 import httpx
 from sqlalchemy import func
@@ -7,7 +8,7 @@ from models import (
     TicketingJob, TicketingAttempt, TicketingJobStatus,
     OtaCallbackJob,
 )
-from services.ticketing_format import build_ticketing_payload
+from services.ticketing_format import build_soraso_payload
 from retry_policy import jittered_offset, RETRY_SCHEDULE_OFFSETS
 
 FORWARDING_PAYLOAD_URL = os.getenv("FORWARDING_PAYLOAD_URL", "").strip()
@@ -39,7 +40,7 @@ async def process_ticketing(order_id: int):
             job = TicketingJob(
                 order_id=order.id,
                 trace_id=order.trace_id,
-                request_payload=build_ticketing_payload(order),
+                request_payload=build_soraso_payload(order),
                 status=TicketingJobStatus.queued,
             )
             db.add(job)
@@ -50,7 +51,7 @@ async def process_ticketing(order_id: int):
             "Content-Type": "application/json",
             "X-Trace-Id": order.trace_id,
             "X-Origin-Partner-Id": order.partner_id,
-            "X-External-Order-Id": order.external_order_id,
+            "X-External-Order-Id": order.order_id,
             "Idempotency-Key": order.trace_id,
         }
 
@@ -80,26 +81,30 @@ async def process_ticketing(order_id: int):
             job.last_error = None if (code and 200 <= code < 300) else (body or "")[:2000]
             job.last_attempt_at = func.now()
             job.status = TicketingJobStatus.in_progress
+            # store response payload if present
+            if body:
+                try:
+                    job.response_payload = {"raw": body[:200000]}
+                except Exception:
+                    job.response_payload = None
             db.commit()
 
-            if code and 200 <= code < 300:
-                # success → mark ticketed
+            if code and 200 <= code < 300 and body:
+                # success with body → mark ticketed
                 order = db.get(Order, order_id)
                 order.pipeline_status = PipelineStatus.ticketed
                 if order_ref:
                     order.ticketing_order_ref = order_ref
-                # optional snapshot
-                # job.response_payload = {"body": body[:2000]}
                 job.status = TicketingJobStatus.ticketed
                 db.commit()
 
-                # create OTA job if not exists
+                # create OTA job if not exists (preload request_payload with original OTA payload)
                 if order.ota_callback_job is None:
                     db.add(OtaCallbackJob(
                         order_id=order.id,
                         trace_id=order.trace_id,
                         callback_url=order.ota_callback_url,
-                        request_payload={},  # filled in OTA worker
+                        request_payload=order.raw_ota_payload,
                         status=None,  # will set in OTA worker
                     ))
                     db.commit()
