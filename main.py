@@ -19,6 +19,8 @@ from models import (
     PartnerRegistration,
 )
 from workers.ticketing import process_ticketing
+from models import Partner, PartnerStatus, AuthEvent, AuthFailReason
+from sqlalchemy import func
 
 load_dotenv()
 
@@ -126,14 +128,37 @@ def validate_callback_url(url: str, allowlist_domains: str | None) -> str:
 
 # ---------------- Auth ----------------
 async def verify_partner(db: Session, request: Request, partner_id: str, partner_token: str) -> Partner:
+    def _log(reason: AuthFailReason):
+        db.add(AuthEvent(
+            partner_id=partner_id,
+            ip=_client_ip(request),
+            reason=reason,
+            user_agent=request.headers.get("user-agent"),
+        ))
+        db.commit()
+
     p: Partner | None = db.query(Partner).filter(Partner.partner_id == partner_id).first()
     if not p:
+        _log(AuthFailReason.no_partner)
         raise HTTPException(status_code=401, detail="Unauthorized")
+
     if p.status != PartnerStatus.active:
-        raise HTTPException(status_code=401, detail="Partner not active")
-    if p.partner_token != partner_token:
+        _log(AuthFailReason.inactive)
         raise HTTPException(status_code=401, detail="Unauthorized")
-    enforce_ip_allowlist(request, getattr(p, "allowlist_source_cidrs", None))
+
+    if p.partner_token != partner_token:
+        _log(AuthFailReason.bad_token)
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # IP allowlist (log if blocked)
+    try:
+        enforce_ip_allowlist(request, getattr(p, "allowlist_source_cidrs", None))
+    except HTTPException as e:
+        if e.status_code == 403:
+            _log(AuthFailReason.ip_block)
+        raise
+
+    # success path: update last_seen_at
     p.last_seen_at = func.now()
     db.add(p)
     db.commit()
