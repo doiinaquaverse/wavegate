@@ -507,6 +507,35 @@ async def soraso_update_by_trace(
     return _apply_soraso_update(db, o, body, background)
 
 
+@app.api_route("/v2/sites/{site_id}/orders/{external_order_id}/fulfill", methods=["POST", "PUT"])
+async def soraso_webflow_style_callback(
+    site_id: str,
+    external_order_id: str,
+    request: Request,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    # Accept body but don't be strict about shape
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+
+    # Find most recent order with this external (OTA) order id
+    o = (
+        db.query(Order)
+        .filter(Order.order_id == external_order_id)
+        .order_by(Order.id.desc())
+        .first()
+    )
+    if not o:
+        raise HTTPException(status_code=404, detail="order not found")
+
+    # Reuse your existing updater to set fulfilled/ticketed & trigger OTA callback
+    return _apply_soraso_update(db, o, payload, background)
+
 # ---------- Legacy partner-protected fulfillment (no IP allowlist) ----------
 @app.put("/orders/{order_pk}/fulfill")
 async def update_fulfill(
