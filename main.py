@@ -507,7 +507,8 @@ async def soraso_update_by_trace(
     return _apply_soraso_update(db, o, body, background)
 
 
-@app.api_route("/v2/sites/{site_id}/orders/{external_order_id}/fulfill", methods=["POST", "PUT"])
+# --- Webflow-style callback that ignores site_id and finds by order_id only ---
+@app.post("/v2/sites/{site_id}/orders/{external_order_id}/fulfill")
 async def soraso_webflow_style_callback(
     site_id: str,
     external_order_id: str,
@@ -515,16 +516,16 @@ async def soraso_webflow_style_callback(
     background: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    # Accept body but don't be strict about shape
+    # Body must be JSON: e.g. {"status":"fulfilled","FulfilledOn":"2025-08-30T05:45:00Z"}
     try:
         payload = await request.json()
         if not isinstance(payload, dict):
-            payload = {}
+            raise ValueError("payload must be an object")
     except Exception:
-        payload = {}
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # Find most recent order with this external (OTA) order id
-    o = (
+    # Find by order_id only (latest if duplicates)
+    o: Order | None = (
         db.query(Order)
         .filter(Order.order_id == external_order_id)
         .order_by(Order.id.desc())
@@ -533,8 +534,43 @@ async def soraso_webflow_style_callback(
     if not o:
         raise HTTPException(status_code=404, detail="order not found")
 
-    # Reuse your existing updater to set fulfilled/ticketed & trigger OTA callback
-    return _apply_soraso_update(db, o, payload, background)
+    status = (payload.get("status") or "").strip().lower()
+    if status not in ("fulfilled", "success"):
+        # record error + 400
+        o.blocked_code = int(payload.get("code") or 400)
+        o.blocked_reason = (payload.get("message") or payload.get("error") or "fulfillment failed")[:2000]
+        o.blocked_at = func.now()
+        db.commit()
+        raise HTTPException(status_code=400, detail="unsupported status")
+
+    # Mark fulfilled
+    o.fulfillment_status = FulfillmentStatus.fulfilled
+    fulfilled_on = payload.get("FulfilledOn") or payload.get("fulfilled_on")
+    if isinstance(fulfilled_on, str) and fulfilled_on:
+        try:
+            o.fulfilled_at = datetime.fromisoformat(fulfilled_on.replace("Z", "+00:00"))
+        except Exception:
+            o.fulfilled_at = func.now()
+    else:
+        o.fulfilled_at = func.now()
+
+    # Clear any block; ensure pipeline marked ticketed
+    o.blocked_code = None
+    o.blocked_reason = None
+    o.blocked_at = None
+    if o.pipeline_status != PipelineStatus.ticketed:
+        o.pipeline_status = PipelineStatus.ticketed
+    db.commit()
+
+    # Kick OTA callback in background
+    try:
+        from workers.ota_callback import process_ota_callback
+        background.add_task(process_ota_callback, o.id)
+    except Exception:
+        pass
+
+    return {**_order_summary(o), "message": "fulfillment recorded"}
+
 
 # ---------- Legacy partner-protected fulfillment (no IP allowlist) ----------
 @app.put("/orders/{order_pk}/fulfill")
