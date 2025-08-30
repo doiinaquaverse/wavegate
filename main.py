@@ -510,7 +510,7 @@ async def soraso_update_by_trace(
 # --- Webflow-style callback that ignores site_id and finds by order_id only ---
 @app.post("/v2/sites/67bec631469ddcaccacc8cb9/orders/{external_order_id}/fulfill")
 async def soraso_webflow_style_callback(
-    site_id: str,
+    # site_id: str,
     external_order_id: str,
     request: Request,
     background: BackgroundTasks,
