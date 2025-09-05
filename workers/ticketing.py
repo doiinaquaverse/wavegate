@@ -1,3 +1,5 @@
+# workers/ticketing.py  (FULL FILE)
+
 import os, asyncio, time
 import httpx
 from sqlalchemy import func
@@ -5,6 +7,7 @@ from db import SessionLocal
 from models import (
     Order, PipelineStatus,
     TicketingJob, TicketingAttempt, TicketingJobStatus,
+    OtaCallbackJob, OtaCallbackJobStatus,
 )
 from services.ticketing_format import build_ticketing_payload
 from retry_policy import jittered_offset, RETRY_SCHEDULE_OFFSETS
@@ -19,9 +22,45 @@ async def _do_ticketing_request(payload: dict, headers: dict):
         r = await client.post(FORWARDING_PAYLOAD_URL, json=payload, headers=headers)
         return r.status_code, (r.text or ""), r.headers.get("X-Ticketing-Order-Ref", "")
 
+async def _mark_ticketed_and_callback(db, order: Order, job: TicketingJob):
+    # pipeline → ticketed (enum-safe)
+    try:
+        cur = getattr(order.pipeline_status, "value", order.pipeline_status)
+        if cur != "ticketed":
+            try:
+                enum_cls = type(order.pipeline_status)
+                order.pipeline_status = enum_cls("ticketed")
+            except Exception:
+                from models import PipelineStatus as PS
+                try:
+                    order.pipeline_status = PS("ticketed")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    job.status = TicketingJobStatus.ticketed
+    db.commit()
+
+    # Ensure an OTA job exists
+    if order.ota_callback_job is None:
+        db.add(OtaCallbackJob(
+            order_id=order.id,
+            trace_id=order.trace_id,
+            callback_url=order.ota_callback_url,
+            request_payload=order.raw_ota_payload,
+            status=OtaCallbackJobStatus.pending,
+        ))
+        db.commit()
+
+    # Kick the OTA callback worker (it is idempotent)
+    try:
+        from workers.ota_callback import process_ota_callback
+        asyncio.create_task(process_ota_callback(order.id))
+    except Exception:
+        pass
+
 async def process_ticketing(order_id: int):
-    if not FORWARDING_PAYLOAD_URL:
-        return
     start = time.monotonic()
     db = SessionLocal()
     try:
@@ -29,6 +68,7 @@ async def process_ticketing(order_id: int):
         if not order:
             return
 
+        # Create or load job
         job = order.ticketing_job
         if job is None:
             job = TicketingJob(
@@ -38,6 +78,16 @@ async def process_ticketing(order_id: int):
                 status=TicketingJobStatus.queued,
             )
             db.add(job); db.commit(); db.refresh(job)
+
+        # ----- SOFT SUCCESS PATH: if no external URL, do not call out -----
+        if not FORWARDING_PAYLOAD_URL:
+            await _mark_ticketed_and_callback(db, order, job)
+            return
+
+        # ----- Normal path: call external ticketing endpoint -----
+        if order.pipeline_status == PipelineStatus.accepted:
+            order.pipeline_status = PipelineStatus.ticketing_processing
+            db.commit()
 
         headers = {
             "Content-Type": "application/json",
@@ -60,6 +110,7 @@ async def process_ticketing(order_id: int):
             except Exception as e:
                 body = str(e)[:2000]
 
+            # refresh and log attempt
             job = db.get(TicketingJob, job.id)
             db.add(TicketingAttempt(
                 ticketing_job_id=job.id,
@@ -80,11 +131,9 @@ async def process_ticketing(order_id: int):
             success = bool(code and 200 <= code < 300 and (ACCEPT_ANY_2XX or body or order_ref))
             if success:
                 order = db.get(Order, order_id)
-                order.pipeline_status = PipelineStatus.ticketing_accepted
                 if order_ref:
                     order.ticketing_order_ref = order_ref
-                job.status = TicketingJobStatus.ticketed
-                db.commit()
+                await _mark_ticketed_and_callback(db, order, job)
                 return
 
             if code and 400 <= code < 500:
@@ -98,6 +147,7 @@ async def process_ticketing(order_id: int):
                 db.commit()
                 return
 
+        # exhausted
         job = db.get(TicketingJob, job.id)
         job.status = TicketingJobStatus.exhausted
         order = db.get(Order, order_id)

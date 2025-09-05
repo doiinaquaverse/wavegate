@@ -700,7 +700,7 @@ async def soraso_webflow_style_callback(
             },
         }
 
-    # 8) Trigger OTA callback ONLY if needed (avoid duplicate workers during Soraso bursts)
+    # 8) Trigger OTA callback ONLY if needed (avoid duplicate workers; do run when pending)
     try:
         from models import OtaCallbackJob, OtaCallbackJobStatus
         from workers.ota_callback import process_ota_callback
@@ -718,9 +718,10 @@ async def soraso_webflow_style_callback(
             db.add(job); db.commit(); db.refresh(o); job = o.ota_callback_job
 
         status_val = getattr(job.status, "value", job.status)
-        # Only enqueue if previously client_error/exhausted/None.
-        # Skip if pending/in_progress/delivered (someone else has it / it’s done)
-        if status_val in (None, "client_error", "exhausted"):
+        pipe_val = getattr(o.pipeline_status, "value", o.pipeline_status)
+
+        # Enqueue when job is new/pending or needs retry; skip if already in_progress/delivered
+        if status_val in (None, "pending", "client_error", "exhausted") and pipe_val != "ota_callback_delivered":
             background.add_task(process_ota_callback, o.id)
     except Exception:
         pass
