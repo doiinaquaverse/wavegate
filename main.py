@@ -660,15 +660,25 @@ async def soraso_webflow_style_callback(
     o.blocked_reason = None
     o.blocked_at = None
 
-    # Robust pipeline transition (avoid enum-attr crashes)
-    current_status = getattr(o.pipeline_status, "value", o.pipeline_status)
-    if current_status != "ticketed":
-        try:
-            from models import PipelineStatus as PS
-            ps_ticketed = PS.__members__.get("ticketed")
-        except Exception:
-            ps_ticketed = None
-        o.pipeline_status = ps_ticketed or "ticketed"
+    # Robust pipeline transition (only assign a real enum member; never a raw string)
+    try:
+        current_status = getattr(o.pipeline_status, "value", o.pipeline_status)
+        if current_status != "ticketed":
+            # First try the enum class of the current value
+            try:
+                enum_cls = type(o.pipeline_status)
+                o.pipeline_status = enum_cls("ticketed")  # e.g., PipelineStatus("ticketed")
+            except Exception:
+                # Fallback to importing the enum class directly
+                try:
+                    from models import PipelineStatus as PS
+                    o.pipeline_status = PS("ticketed")
+                except Exception:
+                    # If the enum doesn't have 'ticketed' in this runtime, leave as-is
+                    pass
+    except Exception:
+        # Last resort: do nothing (avoid crashing)
+        pass
 
     db.commit(); db.refresh(o)
 
