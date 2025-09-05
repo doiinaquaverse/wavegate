@@ -1,4 +1,4 @@
-# workers/ticketing.py  (FULL FILE)
+# workers/ticketing.py  (FULL FILE — paste and overwrite)
 
 import os, asyncio, time
 import httpx
@@ -17,27 +17,42 @@ ACCEPT_ANY_2XX = os.getenv("TICKETING_ACCEPT_ANY_2XX", "0").lower() in ("1","tru
 AUTH_NAME = os.getenv("TICKETING_AUTH_HEADER_NAME")
 AUTH_VALUE = os.getenv("TICKETING_AUTH_HEADER_VALUE")
 
+# ---------------- helpers: enum-safe get/set ----------------
+
+def _ps_val(x):
+    """Return the string value of PipelineStatus or raw string."""
+    return getattr(x, "value", x)
+
+def _set_pipeline_status(order: Order, status_str: str):
+    """Set order.pipeline_status using enum coercion, but never crash if enum differs at runtime."""
+    try:
+        enum_cls = type(order.pipeline_status)  # current enum type
+        order.pipeline_status = enum_cls(status_str)
+        return
+    except Exception:
+        try:
+            from models import PipelineStatus as PS
+            order.pipeline_status = PS(status_str)
+            return
+        except Exception:
+            # leave unchanged if this member doesn't exist in the loaded enum
+            return
+
+# ---------------- outbound HTTP ----------------
+
 async def _do_ticketing_request(payload: dict, headers: dict):
+    # longer timeout + follow redirects
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
         r = await client.post(FORWARDING_PAYLOAD_URL, json=payload, headers=headers)
+        # keep header for order ref if present
         return r.status_code, (r.text or ""), r.headers.get("X-Ticketing-Order-Ref", "")
+
+# ---------------- success path & callback ----------------
 
 async def _mark_ticketed_and_callback(db, order: Order, job: TicketingJob):
     # pipeline → ticketed (enum-safe)
-    try:
-        cur = getattr(order.pipeline_status, "value", order.pipeline_status)
-        if cur != "ticketed":
-            try:
-                enum_cls = type(order.pipeline_status)
-                order.pipeline_status = enum_cls("ticketed")
-            except Exception:
-                from models import PipelineStatus as PS
-                try:
-                    order.pipeline_status = PS("ticketed")
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    if _ps_val(order.pipeline_status) != "ticketed":
+        _set_pipeline_status(order, "ticketed")
 
     job.status = TicketingJobStatus.ticketed
     db.commit()
@@ -59,6 +74,8 @@ async def _mark_ticketed_and_callback(db, order: Order, job: TicketingJob):
         asyncio.create_task(process_ota_callback(order.id))
     except Exception:
         pass
+
+# ---------------- main entry ----------------
 
 async def process_ticketing(order_id: int):
     start = time.monotonic()
@@ -85,8 +102,8 @@ async def process_ticketing(order_id: int):
             return
 
         # ----- Normal path: call external ticketing endpoint -----
-        if order.pipeline_status == PipelineStatus.accepted:
-            order.pipeline_status = PipelineStatus.ticketing_processing
+        if _ps_val(order.pipeline_status) == "accepted":
+            _set_pipeline_status(order, "ticketing_processing")
             db.commit()
 
         headers = {
@@ -138,7 +155,7 @@ async def process_ticketing(order_id: int):
 
             if code and 400 <= code < 500:
                 order = db.get(Order, order_id)
-                order.pipeline_status = PipelineStatus.ticketing_blocked
+                _set_pipeline_status(order, "ticketing_blocked")
                 order.blocked_code = code
                 order.blocked_reason = (body or "")[:2000]
                 order.blocked_at = func.now()
@@ -151,7 +168,7 @@ async def process_ticketing(order_id: int):
         job = db.get(TicketingJob, job.id)
         job.status = TicketingJobStatus.exhausted
         order = db.get(Order, order_id)
-        order.pipeline_status = PipelineStatus.ticketing_blocked
+        _set_pipeline_status(order, "ticketing_blocked")
         order.blocked_code = job.last_status_code or 599
         order.blocked_reason = (job.last_error or "ticketing exhausted")[:2000]
         order.blocked_at = func.now()
