@@ -32,7 +32,7 @@ APP_NAME = os.getenv("APP_NAME", "WaveGate")
 DEBUG = os.getenv("DEBUG", "0").lower() in ("1", "true", "yes", "on")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 SORASO_CALLBACK_TOKEN = os.getenv("SORASO_CALLBACK_TOKEN")
-SORASO_SITE_ID = os.getenv("SORASO_SITE_ID")
+SORASO_SITE_ID = os.getenv("SORASO_SITE_ID","").strip()
 CALLBACK_SIGNING_SECRET = os.getenv("CALLBACK_SIGNING_SECRET")
 app = FastAPI(title=APP_NAME, debug=DEBUG)
 bangkok_timezone = timezone(timedelta(hours=7))
@@ -576,6 +576,10 @@ async def soraso_update_by_trace(
         raise HTTPException(status_code=404, detail="order not found")
     return _apply_soraso_update(db, o, body, background)
 
+# at the top of main.py
+SORASO_SITE_ID = os.getenv("SORASO_SITE_ID", "").strip()
+
+# flexible route, but enforces the env site id
 @app.post("/v2/sites/{site_id}/orders/{external_order_id}/fulfill")
 async def soraso_webflow_style_callback(
     site_id: str,
@@ -584,11 +588,11 @@ async def soraso_webflow_style_callback(
     background: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
+    # Make sure the site_id in the URL matches the one Soraso assigned
     if SORASO_SITE_ID and site_id != SORASO_SITE_ID:
         raise HTTPException(status_code=404, detail="site not found")
 
-    _check_soraso_auth(request)
-
+    # Parse body JSON
     try:
         payload = await request.json()
         if not isinstance(payload, dict):
@@ -596,6 +600,7 @@ async def soraso_webflow_style_callback(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
+    # Find the order
     o: Order | None = (
         db.query(Order)
         .filter(Order.order_id == external_order_id)
@@ -605,14 +610,16 @@ async def soraso_webflow_style_callback(
     if not o:
         raise HTTPException(status_code=404, detail="order not found")
 
+    # Check status
     status = (payload.get("status") or "").strip().lower()
-    if status not in ("fulfilled", "success", "ticketed"):
+    if status not in ("fulfilled", "success"):
         o.blocked_code = int(payload.get("code") or 400)
         o.blocked_reason = (payload.get("message") or payload.get("error") or "fulfillment failed")[:2000]
         o.blocked_at = func.now()
         db.commit()
         raise HTTPException(status_code=400, detail="unsupported status")
 
+    # Mark fulfilled
     o.fulfillment_status = FulfillmentStatus.fulfilled
     fulfilled_on = payload.get("FulfilledOn") or payload.get("fulfilled_on")
     if isinstance(fulfilled_on, str) and fulfilled_on:
@@ -626,17 +633,19 @@ async def soraso_webflow_style_callback(
     o.blocked_code = None
     o.blocked_reason = None
     o.blocked_at = None
-
-    if o.pipeline_status != PipelineStatus.ota_callback_pending:
-        o.pipeline_status = PipelineStatus.ticketing_accepted
+    if o.pipeline_status != PipelineStatus.ticketed:
+        o.pipeline_status = PipelineStatus.ticketed
     db.commit()
 
+    # Trigger OTA callback
     try:
+        from workers.ota_callback import process_ota_callback
         background.add_task(process_ota_callback, o.id)
     except Exception:
         pass
 
     return {**_order_summary(o), "message": "fulfillment recorded"}
+
 
 # ---------- Legacy partner-protected fulfillment (optional) ----------
 @app.put("/orders/{order_pk}/fulfill")
