@@ -590,28 +590,28 @@ async def soraso_webflow_style_callback(
     background: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    # 1) Enforce the Soraso-assigned site id (hide mismatch as 404)
+    # 1) Enforce the Soraso-assigned site id from .env (hide mismatch as 404)
     if SORASO_SITE_ID and site_id != SORASO_SITE_ID:
         raise HTTPException(status_code=404, detail="site not found")
 
-    # 2) Optional shared secret header
+    # 2) Optional shared secret header for extra safety
     if SORASO_CALLBACK_TOKEN:
         token = request.headers.get("x-callback-token", "")
         if token != SORASO_CALLBACK_TOKEN:
             raise HTTPException(status_code=403, detail="forbidden")
 
-    # 3) Read body ONCE; Soraso may send empty body per their spec
+    # 3) Soraso may POST with **empty body** (their spec)
     raw = await request.body()
     payload = None
 
-    # Try JSON first
+    # Try JSON first (if there is a body)
     if raw:
         try:
             payload = json.loads(raw.decode("utf-8"))
         except Exception:
             payload = None
 
-    # Fallback: form-encoded or querystring in body
+    # Fallback: form-encoded in body
     if not isinstance(payload, dict):
         try:
             qs = parse_qs(raw.decode("utf-8", "ignore"), keep_blank_values=True)
@@ -619,7 +619,7 @@ async def soraso_webflow_style_callback(
         except Exception:
             payload = {}
 
-    # Normalize fields (may be entirely missing for empty POST)
+    # Normalize fields (may be missing entirely)
     status_raw = (str(payload.get("status") or payload.get("Status") or "").strip().lower())
     fulfilled_on = payload.get("FulfilledOn") or payload.get("fulfilled_on")
 
@@ -627,7 +627,7 @@ async def soraso_webflow_style_callback(
     if not status_raw:
         status_raw = "fulfilled"
 
-    # 4) Find latest order by the external id
+    # 4) Find latest order by external id
     o: Order | None = (
         db.query(Order)
         .filter(Order.order_id == external_order_id)
@@ -637,7 +637,7 @@ async def soraso_webflow_style_callback(
     if not o:
         raise HTTPException(status_code=404, detail="order not found")
 
-    # 5) Validate "success" status (be forgiving)
+    # 5) Validate status (be forgiving)
     if status_raw not in SUCCESS_STATUSES:
         o.blocked_code = int(payload.get("code") or 400) if str(payload.get("code") or "").isdigit() else 400
         o.blocked_reason = (payload.get("message") or payload.get("error") or f"fulfillment failed (status={status_raw})")[:2000]
@@ -660,29 +660,25 @@ async def soraso_webflow_style_callback(
     o.blocked_reason = None
     o.blocked_at = None
 
-    # Robust pipeline transition (only assign a real enum member; never a raw string)
+    # Robust pipeline transition (avoid enum/runtime mismatches)
     try:
         current_status = getattr(o.pipeline_status, "value", o.pipeline_status)
         if current_status != "ticketed":
-            # First try the enum class of the current value
             try:
-                enum_cls = type(o.pipeline_status)
-                o.pipeline_status = enum_cls("ticketed")  # e.g., PipelineStatus("ticketed")
+                enum_cls = type(o.pipeline_status)         # current Enum type
+                o.pipeline_status = enum_cls("ticketed")   # set via enum value
             except Exception:
-                # Fallback to importing the enum class directly
+                from models import PipelineStatus as PS     # fallback
                 try:
-                    from models import PipelineStatus as PS
                     o.pipeline_status = PS("ticketed")
                 except Exception:
-                    # If the enum doesn't have 'ticketed' in this runtime, leave as-is
-                    pass
+                    pass  # leave as-is if enum lacks this member at runtime
     except Exception:
-        # Last resort: do nothing (avoid crashing)
         pass
 
     db.commit(); db.refresh(o)
 
-    # 7) Build and RETURN Soraso-style JSON with updated status
+    # 7) Build and RETURN Soraso-style JSON (they said: return the order with updated status)
     resp = build_ticketing_payload(o)  # {"TriggerType": "...", "Payload": {...}}
     try:
         pl = dict(resp.get("Payload") or {})
@@ -704,14 +700,33 @@ async def soraso_webflow_style_callback(
             },
         }
 
-    # 8) Trigger OTA callback to partner's callback_url (async)
+    # 8) Trigger OTA callback ONLY if needed (avoid duplicate workers during Soraso bursts)
     try:
+        from models import OtaCallbackJob, OtaCallbackJobStatus
         from workers.ota_callback import process_ota_callback
-        background.add_task(process_ota_callback, o.id)
+
+        # Ensure a job exists (idempotent)
+        job = o.ota_callback_job
+        if job is None:
+            job = OtaCallbackJob(
+                order_id=o.id,
+                trace_id=o.trace_id,
+                callback_url=o.ota_callback_url,
+                request_payload=o.raw_ota_payload,
+                status=OtaCallbackJobStatus.pending,
+            )
+            db.add(job); db.commit(); db.refresh(o); job = o.ota_callback_job
+
+        status_val = getattr(job.status, "value", job.status)
+        # Only enqueue if previously client_error/exhausted/None.
+        # Skip if pending/in_progress/delivered (someone else has it / it’s done)
+        if status_val in (None, "client_error", "exhausted"):
+            background.add_task(process_ota_callback, o.id)
     except Exception:
         pass
 
     return resp
+
 
 
 # ---------- Legacy partner-protected fulfillment (optional) ----------
