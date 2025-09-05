@@ -1,6 +1,5 @@
-# workers/ota_callback.py
-import asyncio, time
-from datetime import datetime
+import os, asyncio, time, hmac, hashlib, json
+from datetime import datetime, timezone
 import httpx
 from sqlalchemy import func
 from db import SessionLocal
@@ -10,9 +9,24 @@ from models import (
 )
 from retry_policy import jittered_offset, RETRY_SCHEDULE_OFFSETS
 
+CALLBACK_SIGNING_SECRET = os.getenv("CALLBACK_SIGNING_SECRET")
+
+def _canonical_json(d: dict) -> str:
+    return json.dumps(d, sort_keys=True, separators=(",", ":"))
+
+def _signature(body: dict) -> str | None:
+    if not CALLBACK_SIGNING_SECRET:
+        return None
+    raw = _canonical_json(body).encode("utf-8")
+    return hmac.new(CALLBACK_SIGNING_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+
 async def _post_callback(url: str, body: dict, headers: dict):
     async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
-        r = await client.post(url, json=body, headers=headers)
+        hdrs = dict(headers)
+        sig = _signature(body)
+        if sig:
+            hdrs["X-Callback-Signature"] = sig
+        r = await client.post(url, json=body, headers=hdrs)
         return r.status_code, (r.text or "")
 
 async def process_ota_callback(order_id: int):
@@ -23,8 +37,7 @@ async def process_ota_callback(order_id: int):
         if not order:
             return
 
-        # mark pending
-        if order.pipeline_status == PipelineStatus.ticketed:
+        if order.pipeline_status in (PipelineStatus.ticketing_accepted,):
             order.pipeline_status = PipelineStatus.ota_callback_pending
             db.commit()
 
@@ -35,11 +48,8 @@ async def process_ota_callback(order_id: int):
                 trace_id=order.trace_id,
                 callback_url=order.ota_callback_url,
                 request_payload=order.raw_ota_payload,  # OTA's original payload
-                status=OtaCallbackJobStatus.pending,
             )
-            db.add(job)
-            db.commit()
-            db.refresh(job)
+            db.add(job); db.commit(); db.refresh(job)
 
         headers = {
             "Content-Type": "application/json",
@@ -54,13 +64,13 @@ async def process_ota_callback(order_id: int):
             if sleep_s:
                 await asyncio.sleep(sleep_s)
 
-            # Prepare response body for OTA (what we will send back)
             response_body = {
                 "order_id": order.order_id,
                 "status": "ticketed",
                 "trace_id": order.trace_id,
-                "customer_emails": order.customer_email,
-                "at": datetime.utcnow().isoformat() + "Z",
+                "ticketing_order_ref": order.ticketing_order_ref,
+                "customer_email": order.customer_email,
+                "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             }
 
             code, text = None, ""
@@ -69,7 +79,6 @@ async def process_ota_callback(order_id: int):
             except Exception as e:
                 text = str(e)[:2000]
 
-            # Log attempt
             job = db.get(OtaCallbackJob, job.id)
             db.add(OtaCallbackAttempt(
                 ota_callback_job_id=job.id,
@@ -83,8 +92,8 @@ async def process_ota_callback(order_id: int):
             job.last_error = None if (code and 200 <= code < 300) else (text or "")[:2000]
             job.last_attempt_at = func.now()
             job.status = OtaCallbackJobStatus.in_progress
-            job.request_payload = order.raw_ota_payload          # as requested
-            job.response_payload = response_body                 # what we send back
+            job.request_payload = order.raw_ota_payload
+            job.response_payload = response_body
             db.commit()
 
             if code and 200 <= code < 300:
@@ -105,9 +114,6 @@ async def process_ota_callback(order_id: int):
                 db.commit()
                 return
 
-            # else retriable; continue
-
-        # exhausted
         job = db.get(OtaCallbackJob, job.id)
         job.status = OtaCallbackJobStatus.exhausted
         db.commit()

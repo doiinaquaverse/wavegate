@@ -1,10 +1,11 @@
-# main.py
 from __future__ import annotations
 
 import os
 import time
 import socket
 import ipaddress
+import asyncio
+import hmac, hashlib, json
 from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
 from typing import Iterable, Set, Optional, List
@@ -22,17 +23,22 @@ from models import (
     PartnerRegistration, AuthEvent, AuthFailReason,
 )
 from workers.ticketing import process_ticketing
+from workers.ota_callback import process_ota_callback
+from rate_limiter import partner_rate_limit
 
 load_dotenv()
 
 APP_NAME = os.getenv("APP_NAME", "WaveGate")
 DEBUG = os.getenv("DEBUG", "0").lower() in ("1", "true", "yes", "on")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
+SORASO_CALLBACK_TOKEN = os.getenv("SORASO_CALLBACK_TOKEN")
+SORASO_SITE_ID = os.getenv("SORASO_SITE_ID")
+CALLBACK_SIGNING_SECRET = os.getenv("CALLBACK_SIGNING_SECRET")
 app = FastAPI(title=APP_NAME, debug=DEBUG)
 bangkok_timezone = timezone(timedelta(hours=7))
 
-# Trust only these proxy CIDRs when reading client IP headers (e.g., Cloudflare egress)
+# Trust only these proxy CIDRs when reading client IP headers
 TRUSTED_PROXY_CIDRS = os.getenv("TRUSTED_PROXY_CIDRS", "")
-
 
 # ---------------- Health ----------------
 @app.get("/health")
@@ -46,12 +52,11 @@ async def health():
 def root():
     return RedirectResponse("/docs", status_code=307)
 
-
 # ---------------- Helpers: csv/ip/ssrf ----------------
 def _csv_set(raw: str | None) -> Set[str]:
     if not raw:
         return set()
-    return {x.strip() for x in raw.split(",") if x.strip()}
+    return {x.strip().lower() for x in raw.split(",") if x.strip()}
 
 def _ip_in_cidrs(ip: str, cidrs: Iterable[str]) -> bool:
     try:
@@ -70,7 +75,6 @@ def _trusted_proxy_peer(peer_ip: str) -> bool:
     return _ip_in_cidrs(peer_ip, _csv_set(TRUSTED_PROXY_CIDRS))
 
 def _client_ip(request: Request) -> str:
-    """Trust CF/LB headers only when the TCP peer is a trusted proxy."""
     peer = request.client.host if request.client else ""
     if _trusted_proxy_peer(peer):
         cf = request.headers.get("cf-connecting-ip")
@@ -89,7 +93,6 @@ def _client_ip(request: Request) -> str:
     return peer or ""
 
 def enforce_ip_allowlist(request: Request, allowlist_source_cidrs: str | None) -> None:
-    """Used **only** for OTA ingress (/orders POST)."""
     cidrs = _csv_set(allowlist_source_cidrs)
     if not cidrs:
         return
@@ -127,21 +130,20 @@ def validate_callback_url(url: str, allowlist_domains: str | None) -> str:
         raise HTTPException(status_code=400, detail="callback_url must use port 443")
     if not p.hostname:
         raise HTTPException(status_code=400, detail="callback_url host missing")
-
     host = p.hostname.lower()
     if host == "localhost" or _is_private_or_loopback_host(host):
         raise HTTPException(status_code=403, detail="callback_url host not allowed")
 
-    allow = _csv_set(allowlist_domains)
+    # merge global + per-partner allowlists
+    global_allow = _csv_set(os.getenv("ALLOWED_CALLBACK_HOSTS"))
+    allow = _csv_set(allowlist_domains) | global_allow
     if allow and not _host_matches_allowlist(host, allow):
         raise HTTPException(status_code=403, detail="callback_url domain not allowed")
 
     return p.geturl()
 
-
 # ---------------- Auth ----------------
 async def verify_partner(db: Session, request: Request, partner_id: str, partner_token: str) -> Partner:
-    """Partner credential check only (no IP allowlist here)."""
     def _log(reason: AuthFailReason):
         db.add(AuthEvent(
             partner_id=partner_id,
@@ -153,19 +155,15 @@ async def verify_partner(db: Session, request: Request, partner_id: str, partner
 
     p: Partner | None = db.query(Partner).filter(Partner.partner_id == partner_id).first()
     if not p:
-        _log(AuthFailReason.no_partner)
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        _log(AuthFailReason.no_partner); raise HTTPException(status_code=401, detail="Unauthorized")
     if p.status != PartnerStatus.active:
-        _log(AuthFailReason.inactive)
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        _log(AuthFailReason.inactive); raise HTTPException(status_code=401, detail="Unauthorized")
     if p.partner_token != partner_token:
-        _log(AuthFailReason.bad_token)
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        _log(AuthFailReason.bad_token); raise HTTPException(status_code=401, detail="Unauthorized")
 
     p.last_seen_at = func.now()
     db.add(p); db.commit()
     return p
-
 
 # ---------------- DTO helpers ----------------
 def _order_summary(o: Order) -> dict:
@@ -177,11 +175,10 @@ def _order_summary(o: Order) -> dict:
         "pipeline_status": o.pipeline_status.value if hasattr(o.pipeline_status, "value") else str(o.pipeline_status),
         "fulfillment_status": o.fulfillment_status.value if hasattr(o.fulfillment_status, "value") else str(o.fulfillment_status),
         "created_at": o.created_at,
+        "accepted_at": getattr(o, "accepted_at", None),
         "fulfilled_at": getattr(o, "fulfilled_at", None),
     }
 
-
-# ---------------- OTA payload parsing ----------------
 def _as_list(v) -> list[str]:
     if v is None:
         return []
@@ -198,23 +195,13 @@ def _ts_from_iso(iso: str | None) -> int:
     if not iso:
         return int(time.time())
     try:
+        from datetime import datetime
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
         return int(dt.timestamp())
     except Exception:
         return int(time.time())
 
 def _extract_ota_payload(payload: dict) -> dict:
-    """
-    Expected OTA shape:
-    {
-      "order": {"id": "...", "accepted_at": "...", "callback_url": "..."},
-      "customer": {"name": "...", "email": "..."},
-      "items": [ { "name": "...", "qty": 1, "unit_price": 159430, "currency":"THB",
-                   "product_id":"...", "variant_id":"...", "variant_name":"..." } ],
-      "amounts": {"currency":"THB","subtotal":...,"total":...,"paid":...},
-      "payment": {"processor":"...","method":"...","details":{...}}
-    }
-    """
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
@@ -267,8 +254,13 @@ def _extract_ota_payload(payload: dict) -> dict:
         "payment_details": payment.get("details") or {},
     }
 
+# ---------------- Admin guard ----------------
+def require_admin(request: Request):
+    if not ADMIN_TOKEN or request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 # ---------------- API ----------------
+
 @app.post("/orders")
 async def create_order(
     request: Request,
@@ -276,11 +268,12 @@ async def create_order(
     partner_id: str = Header(..., alias="X-Partner-Id"),
     partner_token: str = Header(..., alias="X-Partner-Token"),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    _: None = Depends(partner_rate_limit),  # per-partner rate limit
     db: Session = Depends(get_db),
 ):
     partner = await verify_partner(db, request, partner_id, partner_token)
 
-    # Enforce IP allowlist **only here** (OTA ingress)
+    # IP allowlist for OTA ingress
     try:
         enforce_ip_allowlist(request, getattr(partner, "allowlist_source_cidrs", None))
     except HTTPException as e:
@@ -294,7 +287,6 @@ async def create_order(
             db.commit()
         raise
 
-    # Parse & normalize inbound OTA payload
     try:
         raw = await request.json()
     except Exception:
@@ -327,6 +319,7 @@ async def create_order(
         total_amount=parsed.get("total_amount"),
         customer_name=parsed.get("customer_name"),
         customer_email=parsed.get("customer_email"),
+        accepted_at=datetime.fromtimestamp(ts, timezone.utc),
         pipeline_status=PipelineStatus.accepted,
         fulfillment_status=FulfillmentStatus.unfulfilled,
         payment_processor=parsed.get("payment_processor"),
@@ -359,12 +352,89 @@ async def create_order(
         ))
 
     db.commit(); db.refresh(order)
+
+    # Kick ticketing in background
     background.add_task(process_ticketing, order.id)
     return _order_summary(order)
 
+# Partner-scoped retrieval (docs-aligned)
+@app.get("/partner/orders")
+async def partner_list_orders(
+    request: Request,
+    limit: int = 50,
+    partner_id: str = Header(..., alias="X-Partner-Id"),
+    partner_token: str = Header(..., alias="X-Partner-Token"),
+    db: Session = Depends(get_db),
+):
+    await verify_partner(db, request, partner_id, partner_token)
+    q: List[Order] = (
+        db.query(Order)
+        .filter(Order.partner_id == partner_id)
+        .order_by(Order.id.desc())
+        .limit(min(limit, 200))
+        .all()
+    )
+    return [_order_summary(o) for o in q]
 
+@app.get("/partner/orders/{order_pk}")
+async def partner_get_order(
+    order_pk: int,
+    request: Request,
+    partner_id: str = Header(..., alias="X-Partner-Id"),
+    partner_token: str = Header(..., alias="X-Partner-Token"),
+    db: Session = Depends(get_db),
+):
+    await verify_partner(db, request, partner_id, partner_token)
+    o: Order | None = db.get(Order, order_pk)
+    if not o or o.partner_id != partner_id:
+        raise HTTPException(status_code=404, detail="not found")
+    return {
+        **_order_summary(o),
+        "blocked": {"code": o.blocked_code, "reason": o.blocked_reason, "at": o.blocked_at},
+        "payment": {
+            "processor": o.payment_processor,
+            "method": o.payment_method,
+            "details": o.payment_details,
+        },
+        "items": [
+            {
+                "line_no": i.line_no,
+                "product_id": i.product_id,
+                "variant_id": i.variant_id,
+                "product_name": i.product_name,
+                "variant_name": i.variant_name,
+                "currency": i.currency,
+                "unit_price": i.unit_price,
+                "qty": i.quantity,
+            } for i in o.items
+        ],
+        "ticketing": {
+            "status": getattr(o.ticketing_job, "status", None),
+            "last_code": getattr(o.ticketing_job, "last_status_code", None),
+            "attempts": [
+                {"no": a.attempt_no, "code": a.status_code, "error": a.error, "at": a.created_at}
+                for a in (o.ticketing_job.attempts if o.ticketing_job else [])
+            ],
+            "request_payload": getattr(o.ticketing_job, "request_payload", None),
+            "response_payload": getattr(o.ticketing_job, "response_payload", None),
+        },
+        "ota_callback": {
+            "status": getattr(o.ota_callback_job, "status", None),
+            "last_code": getattr(o.ota_callback_job, "last_status_code", None),
+            "delivered_at": getattr(o.ota_callback_job, "delivered_at", None),
+            "attempts": [
+                {"no": a.attempt_no, "code": a.status_code, "error": a.error, "at": a.created_at}
+                for a in (o.ota_callback_job.attempts if o.ota_callback_job else [])
+            ],
+            "request_payload": getattr(o.ota_callback_job, "request_payload", None),
+            "response_payload": getattr(o.ota_callback_job, "response_payload", None),
+        },
+    }
+
+# Internal admin list (protected)
 @app.get("/orders")
-def list_orders(limit: int = 50, db: Session = Depends(get_db)):
+def list_orders(limit: int = 50, db: Session = Depends(get_db), request: Request = None):
+    require_admin(request)
     q: List[Order] = (
         db.query(Order)
         .order_by(Order.id.desc())
@@ -374,7 +444,8 @@ def list_orders(limit: int = 50, db: Session = Depends(get_db)):
     return [_order_summary(o) for o in q]
 
 @app.get("/orders/{order_pk}")
-def get_order(order_pk: int, db: Session = Depends(get_db)):
+def get_order(order_pk: int, db: Session = Depends(get_db), request: Request = None):
+    require_admin(request)
     o: Order | None = db.get(Order, order_pk)
     if not o:
         raise HTTPException(status_code=404, detail="not found")
@@ -421,16 +492,13 @@ def get_order(order_pk: int, db: Session = Depends(get_db)):
         },
     }
 
+# ---------- Soraso callbacks (no auth required by partner headers) ----------
+def _check_soraso_auth(request: Request):
+    token = request.headers.get("X-Callback-Token")
+    if SORASO_CALLBACK_TOKEN and token != SORASO_CALLBACK_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-# ---------- Soraso callbacks (PUT updated payload; no token) ----------
 def _apply_soraso_update(db: Session, o: Order, payload: dict, background: BackgroundTasks):
-    """
-    Accept Soraso's updated payload (any shape).
-    - Save full payload to ticketing_job.response_payload (merge).
-    - Update fulfillment fields if Status/FulfilledOn are present.
-    - Ensure pipeline_status progresses to 'ticketed' on success.
-    - Trigger OTA callback on success.
-    """
     if o.ticketing_job:
         prev = o.ticketing_job.response_payload or {}
         merged = {**prev, **payload} if isinstance(prev, dict) and isinstance(payload, dict) else {"previous": prev, "current": payload}
@@ -449,21 +517,21 @@ def _apply_soraso_update(db: Session, o: Order, payload: dict, background: Backg
         except Exception:
             o.fulfilled_at = func.now()
 
-        if o.pipeline_status != PipelineStatus.ticketed:
-            o.pipeline_status = PipelineStatus.ticketed
-
         o.blocked_code = None
         o.blocked_reason = None
         o.blocked_at = None
+
+        # if Soraso accepted earlier, proceed to OTA callback
+        if o.pipeline_status != PipelineStatus.ota_callback_pending:
+            o.pipeline_status = PipelineStatus.ticketing_accepted
         db.commit()
 
         try:
-            from workers.ota_callback import process_ota_callback
             background.add_task(process_ota_callback, o.id)
         except Exception:
             pass
 
-        return {"ok": True, "message": "updated and ticketed", **_order_summary(o)}
+        return {"ok": True, "message": "updated and fulfillment recorded", **_order_summary(o)}
 
     code = payload.get("code")
     msg = payload.get("message") or payload.get("error")
@@ -483,6 +551,7 @@ async def soraso_update_by_partner_order(
     body: dict = Body(...),
     db: Session = Depends(get_db),
 ):
+    _check_soraso_auth(request)
     o = (
         db.query(Order)
         .filter(Order.partner_id == partner_id, Order.order_id == order_id)
@@ -501,22 +570,25 @@ async def soraso_update_by_trace(
     body: dict = Body(...),
     db: Session = Depends(get_db),
 ):
+    _check_soraso_auth(request)
     o = db.query(Order).filter(Order.trace_id == trace_id).first()
     if not o:
         raise HTTPException(status_code=404, detail="order not found")
     return _apply_soraso_update(db, o, body, background)
 
-
-# --- Webflow-style callback that ignores site_id and finds by order_id only ---
-@app.post("/v2/sites/67bec631469ddcaccacc8cb9/orders/{external_order_id}/fulfill")
+@app.post("/v2/sites/{site_id}/orders/{external_order_id}/fulfill")
 async def soraso_webflow_style_callback(
-    # site_id: str,
+    site_id: str,
     external_order_id: str,
     request: Request,
     background: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    # Body must be JSON: e.g. {"status":"fulfilled","FulfilledOn":"2025-08-30T05:45:00Z"}
+    if SORASO_SITE_ID and site_id != SORASO_SITE_ID:
+        raise HTTPException(status_code=404, detail="site not found")
+
+    _check_soraso_auth(request)
+
     try:
         payload = await request.json()
         if not isinstance(payload, dict):
@@ -524,7 +596,6 @@ async def soraso_webflow_style_callback(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # Find by order_id only (latest if duplicates)
     o: Order | None = (
         db.query(Order)
         .filter(Order.order_id == external_order_id)
@@ -535,15 +606,13 @@ async def soraso_webflow_style_callback(
         raise HTTPException(status_code=404, detail="order not found")
 
     status = (payload.get("status") or "").strip().lower()
-    if status not in ("fulfilled", "success"):
-        # record error + 400
+    if status not in ("fulfilled", "success", "ticketed"):
         o.blocked_code = int(payload.get("code") or 400)
         o.blocked_reason = (payload.get("message") or payload.get("error") or "fulfillment failed")[:2000]
         o.blocked_at = func.now()
         db.commit()
         raise HTTPException(status_code=400, detail="unsupported status")
 
-    # Mark fulfilled
     o.fulfillment_status = FulfillmentStatus.fulfilled
     fulfilled_on = payload.get("FulfilledOn") or payload.get("fulfilled_on")
     if isinstance(fulfilled_on, str) and fulfilled_on:
@@ -554,25 +623,22 @@ async def soraso_webflow_style_callback(
     else:
         o.fulfilled_at = func.now()
 
-    # Clear any block; ensure pipeline marked ticketed
     o.blocked_code = None
     o.blocked_reason = None
     o.blocked_at = None
-    if o.pipeline_status != PipelineStatus.ticketed:
-        o.pipeline_status = PipelineStatus.ticketed
+
+    if o.pipeline_status != PipelineStatus.ota_callback_pending:
+        o.pipeline_status = PipelineStatus.ticketing_accepted
     db.commit()
 
-    # Kick OTA callback in background
     try:
-        from workers.ota_callback import process_ota_callback
         background.add_task(process_ota_callback, o.id)
     except Exception:
         pass
 
     return {**_order_summary(o), "message": "fulfillment recorded"}
 
-
-# ---------- Legacy partner-protected fulfillment (no IP allowlist) ----------
+# ---------- Legacy partner-protected fulfillment (optional) ----------
 @app.put("/orders/{order_pk}/fulfill")
 async def update_fulfill(
     order_pk: int,
@@ -582,7 +648,6 @@ async def update_fulfill(
     db: Session = Depends(get_db),
 ):
     partner = await verify_partner(db, request, partner_id, partner_token)
-
     o: Order | None = db.get(Order, order_pk)
     if not o or o.partner_id != partner.partner_id:
         raise HTTPException(status_code=404, detail="not found")
@@ -614,19 +679,17 @@ async def update_fulfill(
     o.blocked_code = None
     o.blocked_reason = None
     o.blocked_at = None
-    if o.pipeline_status != PipelineStatus.ticketed:
-        o.pipeline_status = PipelineStatus.ticketed
+    if o.pipeline_status != PipelineStatus.ota_callback_pending:
+        o.pipeline_status = PipelineStatus.ticketing_accepted
     db.commit()
 
     try:
-        from workers.ota_callback import process_ota_callback
         background = BackgroundTasks()
         background.add_task(process_ota_callback, o.id)
     except Exception:
         pass
 
     return {**_order_summary(o), "message": "fulfillment recorded"}
-
 
 # ---------- Partner Registration ----------
 @app.post("/partners/register")
@@ -665,8 +728,7 @@ async def register_partner(payload: dict, db: Session = Depends(get_db)):
     db.add(rec); db.commit()
     return {"ok": True, "id": rec.id}
 
-
-# ---------- (Optional) Debug: see detected client IP ----------
+# ---------- Debug: detected client IP ----------
 @app.get("/debug/ip")
 def debug_ip(request: Request):
     return {

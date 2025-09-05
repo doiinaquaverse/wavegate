@@ -1,4 +1,3 @@
-# retry_policy.py
 import random
 
 RETRY_SCHEDULE_OFFSETS = [0, 2, 6, 12, 20, 30, 45, 65, 90, 120, 155, 195, 235, 270, 300]

@@ -1,21 +1,11 @@
-# models.py
 from __future__ import annotations
 import enum
 import uuid
 from typing import Optional
 
 from sqlalchemy import (
-    String,
-    Text,
-    TIMESTAMP,
-    Enum,
-    func,
-    Integer,
-    BigInteger,
-    ForeignKey,
-    UniqueConstraint,
-    JSON,
-    Index,
+    String, Text, TIMESTAMP, Enum, func, Integer, BigInteger,
+    ForeignKey, UniqueConstraint, JSON, Index
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -28,9 +18,8 @@ class PartnerStatus(enum.Enum):
     terminated = "terminated"
 
 class PipelineStatus(enum.Enum):
-    accepted = "accepted"
-    ticketing_processing = "ticketing_processing"
-    ticketed = "ticketed"
+    accepted = "accepted"                     # order accepted by WaveGate
+    ticketing_accepted = "ticketing_accepted" # Soraso 2xx received (not yet fulfilled)
     ota_callback_pending = "ota_callback_pending"
     ota_callback_delivered = "ota_callback_delivered"
     ticketing_blocked = "ticketing_blocked"
@@ -43,7 +32,7 @@ class FulfillmentStatus(enum.Enum):
 class TicketingJobStatus(enum.Enum):
     queued = "queued"
     in_progress = "in_progress"
-    ticketed = "ticketed"
+    ticketed = "ticketed"     # kept label, means Soraso accepted (2xx)
     client_error = "client_error"
     exhausted = "exhausted"
 
@@ -74,12 +63,8 @@ class Partner(Base):
         default=PartnerStatus.active,
         nullable=False,
     )
-    webhook: Mapped[Optional[str]] = mapped_column(Text)  # optional default webhook from registration
-    created_at: Mapped[str] = mapped_column(
-        TIMESTAMP(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
+    webhook: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
     last_seen_at: Mapped[Optional[str]] = mapped_column(TIMESTAMP(timezone=True))
     allowlist_domains: Mapped[Optional[str]] = mapped_column(Text)
     allowlist_source_cidrs: Mapped[Optional[str]] = mapped_column(Text)
@@ -121,6 +106,7 @@ class Order(Base):
     total_amount: Mapped[Optional[int]] = mapped_column(BigInteger)
     customer_name: Mapped[Optional[str]] = mapped_column(String(255))
     customer_email: Mapped[Optional[str]] = mapped_column(String(320), index=True)
+    accepted_at: Mapped[Optional[str]] = mapped_column(TIMESTAMP(timezone=True))
 
     # Pipeline & fulfillment
     pipeline_status: Mapped[PipelineStatus] = mapped_column(
@@ -152,57 +138,23 @@ class Order(Base):
     payment_details: Mapped[Optional[dict]] = mapped_column(JSON)
 
     # Timestamps
-    created_at: Mapped[str] = mapped_column(
-        TIMESTAMP(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
-    updated_at: Mapped[str] = mapped_column(
-        TIMESTAMP(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-        nullable=False,
-    )
+    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     # relationships
-    items: Mapped[list["OrderItem"]] = relationship(
-        back_populates="order",
-        cascade="all, delete-orphan",
-        lazy="selectin",
-    )
-    ticketing_job: Mapped[Optional["TicketingJob"]] = relationship(
-        back_populates="order",
-        uselist=False,
-        lazy="joined",
-    )
-    ota_callback_job: Mapped[Optional["OtaCallbackJob"]] = relationship(
-        back_populates="order",
-        uselist=False,
-        lazy="joined",
-    )
-    idempotency_keys: Mapped[list["IdempotencyKey"]] = relationship(
-        back_populates="order",
-        cascade="all, delete-orphan",
-        lazy="selectin",
-    )
+    items: Mapped[list["OrderItem"]] = relationship(back_populates="order", cascade="all, delete-orphan", lazy="selectin")
+    ticketing_job: Mapped[Optional["TicketingJob"]] = relationship(back_populates="order", uselist=False, lazy="joined")
+    ota_callback_job: Mapped[Optional["OtaCallbackJob"]] = relationship(back_populates="order", uselist=False, lazy="joined")
+    idempotency_keys: Mapped[list["IdempotencyKey"]] = relationship(back_populates="order", cascade="all, delete-orphan", lazy="selectin")
 
 # ---------------- OrderItems ----------------
 
 class OrderItem(Base):
     __tablename__ = "order_items"
-    __table_args__ = (
-        Index("ix_order_items_product_id", "product_id"),
-    )
+    __table_args__ = (Index("ix_order_items_product_id", "product_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    order_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("orders.id", onupdate="RESTRICT", ondelete="CASCADE"),
-        index=True,
-        nullable=False,
-    )
-
+    order_id: Mapped[int] = mapped_column(Integer, ForeignKey("orders.id", onupdate="RESTRICT", ondelete="CASCADE"), index=True, nullable=False)
     trace_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
     line_no: Mapped[Optional[int]] = mapped_column(Integer)
 
@@ -210,6 +162,10 @@ class OrderItem(Base):
     product_name: Mapped[Optional[str]] = mapped_column(Text)
     variant_id: Mapped[Optional[str]] = mapped_column(String(200))
     variant_name: Mapped[Optional[str]] = mapped_column(Text)
+    product_slug: Mapped[Optional[str]] = mapped_column(String(200))
+    variant_slug: Mapped[Optional[str]] = mapped_column(String(200))
+    variant_sku: Mapped[Optional[str]] = mapped_column(String(200))
+    variant_image_url: Mapped[Optional[str]] = mapped_column(Text)
 
     unit_price: Mapped[Optional[int]] = mapped_column(BigInteger)  # minor units
     currency: Mapped[Optional[str]] = mapped_column(String(10))
@@ -217,13 +173,8 @@ class OrderItem(Base):
 
     meta: Mapped[Optional[dict]] = mapped_column(JSON)
 
-    created_at: Mapped[str] = mapped_column(
-        TIMESTAMP(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
+    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
 
-    # back reference to Order
     order: Mapped["Order"] = relationship(back_populates="items")
 
 # ---------------- TicketingJobs ----------------
@@ -237,18 +188,10 @@ class TicketingJob(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    order_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("orders.id", onupdate="RESTRICT", ondelete="CASCADE"),
-        nullable=False,
-    )
-
+    order_id: Mapped[int] = mapped_column(Integer, ForeignKey("orders.id", onupdate="RESTRICT", ondelete="CASCADE"), nullable=False)
     trace_id: Mapped[str] = mapped_column(String(128), nullable=False)
-
     request_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     response_payload: Mapped[Optional[dict]] = mapped_column(JSON)
-
     last_status_code: Mapped[Optional[int]] = mapped_column(Integer)
     last_error: Mapped[Optional[str]] = mapped_column(Text)
     last_attempt_at: Mapped[Optional[str]] = mapped_column(TIMESTAMP(timezone=True))
@@ -260,27 +203,11 @@ class TicketingJob(Base):
         index=True,
     )
 
-    created_at: Mapped[str] = mapped_column(
-        TIMESTAMP(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
-    updated_at: Mapped[str] = mapped_column(
-        TIMESTAMP(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-        nullable=False,
-    )
+    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    # backref to Order (1:1)
     order: Mapped["Order"] = relationship(back_populates="ticketing_job")
-
-    # attempts relationship
-    attempts: Mapped[list["TicketingAttempt"]] = relationship(
-        back_populates="ticketing_job",
-        cascade="all, delete-orphan",
-        lazy="selectin",
-    )
+    attempts: Mapped[list["TicketingAttempt"]] = relationship(back_populates="ticketing_job", cascade="all, delete-orphan", lazy="selectin")
 
 # ---------------- TicketingAttempts ----------------
 
@@ -292,28 +219,14 @@ class TicketingAttempt(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    ticketing_job_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("ticketing_jobs.id", onupdate="RESTRICT", ondelete="CASCADE"),
-        index=True,
-        nullable=False,
-    )
-
+    ticketing_job_id: Mapped[int] = mapped_column(Integer, ForeignKey("ticketing_jobs.id", onupdate="RESTRICT", ondelete="CASCADE"), index=True, nullable=False)
     trace_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
-
     attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
     status_code: Mapped[Optional[int]] = mapped_column(Integer)
     error: Mapped[Optional[str]] = mapped_column(Text)
     duration_ms: Mapped[Optional[int]] = mapped_column(Integer)
+    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
 
-    created_at: Mapped[str] = mapped_column(
-        TIMESTAMP(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
-
-    # backref to the job
     ticketing_job: Mapped["TicketingJob"] = relationship(back_populates="attempts")
 
 # ---------------- OtaCallbackJobs ----------------
@@ -326,15 +239,8 @@ class OtaCallbackJob(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    order_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("orders.id", onupdate="RESTRICT", ondelete="CASCADE"),
-        nullable=False,
-    )
-
+    order_id: Mapped[int] = mapped_column(Integer, ForeignKey("orders.id", onupdate="RESTRICT", ondelete="CASCADE"), nullable=False)
     trace_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
-
     callback_url: Mapped[str] = mapped_column(Text, nullable=False)
 
     request_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
@@ -352,27 +258,11 @@ class OtaCallbackJob(Base):
         index=True,
     )
 
-    created_at: Mapped[str] = mapped_column(
-        TIMESTAMP(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
-    updated_at: Mapped[str] = mapped_column(
-        TIMESTAMP(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-        nullable=False,
-    )
+    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    # backref to Order (1:1)
     order: Mapped["Order"] = relationship(back_populates="ota_callback_job")
-
-    # attempts relationship
-    attempts: Mapped[list["OtaCallbackAttempt"]] = relationship(
-        back_populates="ota_callback_job",
-        cascade="all, delete-orphan",
-        lazy="selectin",
-    )
+    attempts: Mapped[list["OtaCallbackAttempt"]] = relationship(back_populates="ota_callback_job", cascade="all, delete-orphan", lazy="selectin")
 
 # ---------------- OtaCallbackAttempts ----------------
 
@@ -384,28 +274,14 @@ class OtaCallbackAttempt(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    ota_callback_job_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("ota_callback_jobs.id", onupdate="RESTRICT", ondelete="CASCADE"),
-        index=True,
-        nullable=False,
-    )
-
+    ota_callback_job_id: Mapped[int] = mapped_column(Integer, ForeignKey("ota_callback_jobs.id", onupdate="RESTRICT", ondelete="CASCADE"), index=True, nullable=False)
     trace_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
-
     attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
     status_code: Mapped[Optional[int]] = mapped_column(Integer)
     error: Mapped[Optional[str]] = mapped_column(Text)
     duration_ms: Mapped[Optional[int]] = mapped_column(Integer)
+    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
 
-    created_at: Mapped[str] = mapped_column(
-        TIMESTAMP(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
-
-    # backref to the job
     ota_callback_job: Mapped["OtaCallbackJob"] = relationship(back_populates="attempts")
 
 # ---------------- IdempotencyKeys ----------------
@@ -424,21 +300,11 @@ class IdempotencyKey(Base):
     )
     key: Mapped[str] = mapped_column(String(200), primary_key=True)
 
-    order_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("orders.id", onupdate="RESTRICT", ondelete="CASCADE"),
-        nullable=False,
-    )
-
+    order_id: Mapped[int] = mapped_column(Integer, ForeignKey("orders.id", onupdate="RESTRICT", ondelete="CASCADE"), nullable=False)
     trace_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
 
-    created_at: Mapped[str] = mapped_column(
-        TIMESTAMP(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
+    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
 
-    # optional ORM convenience
     order: Mapped["Order"] = relationship(back_populates="idempotency_keys")
 
 # ---------------- AuthEvents ----------------
@@ -452,21 +318,11 @@ class AuthEvent(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
     partner_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
-
     ip: Mapped[Optional[str]] = mapped_column(String(64))
-    reason: Mapped[AuthFailReason] = mapped_column(
-        Enum(AuthFailReason, native_enum=False),
-        nullable=False,
-    )
+    reason: Mapped[AuthFailReason] = mapped_column(Enum(AuthFailReason, native_enum=False), nullable=False)
     user_agent: Mapped[Optional[str]] = mapped_column(Text)
-
-    created_at: Mapped[str] = mapped_column(
-        TIMESTAMP(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
+    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
 
 # ---------------- Partner Registrations ----------------
 
@@ -507,4 +363,4 @@ class PartnerRegistration(Base):
     usecase: Mapped[Optional[list]] = mapped_column(JSON)
     compliance: Mapped[Optional[dict]] = mapped_column(JSON)
 
-    raw: Mapped[Optional[dict]] = mapped_column(JSON)  # full original payload
+    raw: Mapped[Optional[dict]] = mapped_column(JSON)
