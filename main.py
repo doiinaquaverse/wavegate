@@ -27,6 +27,8 @@ from workers.ota_callback import process_ota_callback
 from rate_limiter import partner_rate_limit
 import json
 from urllib.parse import parse_qs
+from datetime import datetime, timezone
+from services.ticketing_format import build_ticketing_payload
 
 load_dotenv()
 
@@ -578,13 +580,6 @@ async def soraso_update_by_trace(
         raise HTTPException(status_code=404, detail="order not found")
     return _apply_soraso_update(db, o, body, background)
 
-# at the top of main.py
-SORASO_SITE_ID = os.getenv("SORASO_SITE_ID", "").strip()
-
-# Accept Soraso fulfill callbacks (Webflow-style path).
-# - Path accepts any {site_id} but we enforce it against SORASO_SITE_ID (404 on mismatch)
-# - Body may be JSON OR application/x-www-form-urlencoded (fallback parser)
-# - Accepted success statuses: fulfilled, success, ticketed, ok
 SUCCESS_STATUSES = {"fulfilled", "success", "ticketed", "ok"}
 
 @app.post("/v2/sites/{site_id}/orders/{external_order_id}/fulfill")
@@ -595,44 +590,44 @@ async def soraso_webflow_style_callback(
     background: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    # Enforce the Soraso-assigned site id from .env (hide with 404 if wrong)
+    # Enforce Soraso-assigned site id (hide mismatch as 404)
     if SORASO_SITE_ID and site_id != SORASO_SITE_ID:
         raise HTTPException(status_code=404, detail="site not found")
 
-    # Optional shared-secret header for extra safety
+    # Optional shared secret
     if SORASO_CALLBACK_TOKEN:
         token = request.headers.get("x-callback-token", "")
         if token != SORASO_CALLBACK_TOKEN:
             raise HTTPException(status_code=403, detail="forbidden")
 
-    # ---- Parse body robustly (read once) ----
+    # ---- Read body once (Soraso may send empty) ----
     raw = await request.body()
     payload = None
 
-    # Try JSON first
+    # Try JSON
     if raw:
         try:
             payload = json.loads(raw.decode("utf-8"))
         except Exception:
             payload = None
 
-    # Fallback: form-encoded or querystring style
+    # Fallback: form-encoded / querystring in body
     if not isinstance(payload, dict):
         try:
-            # Starlette can parse form(), but using parse_qs works directly on raw bytes
             qs = parse_qs(raw.decode("utf-8", "ignore"), keep_blank_values=True)
             payload = {k: (v[0] if isinstance(v, list) and v else v) for k, v in qs.items()}
         except Exception:
             payload = {}
 
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    # Normalize fields
+    # Normalize fields (may be missing entirely)
     status_raw = (str(payload.get("status") or payload.get("Status") or "").strip().lower())
     fulfilled_on = payload.get("FulfilledOn") or payload.get("fulfilled_on")
 
-    # ---- Find order by external_order_id ----
+    # If Soraso sends no body → treat as success (per their spec)
+    if not status_raw:
+        status_raw = "fulfilled"
+
+    # ---- Find latest order by external id ----
     o: Order | None = (
         db.query(Order)
         .filter(Order.order_id == external_order_id)
@@ -642,15 +637,15 @@ async def soraso_webflow_style_callback(
     if not o:
         raise HTTPException(status_code=404, detail="order not found")
 
-    # ---- Validate status ----
+    # ---- Validate success ----
     if status_raw not in SUCCESS_STATUSES:
         o.blocked_code = int(payload.get("code") or 400) if str(payload.get("code") or "").isdigit() else 400
-        o.blocked_reason = (payload.get("message") or payload.get("error") or f"fulfillment failed (status={status_raw or 'missing'})")[:2000]
+        o.blocked_reason = (payload.get("message") or payload.get("error") or f"fulfillment failed (status={status_raw})")[:2000]
         o.blocked_at = func.now()
         db.commit()
         raise HTTPException(status_code=400, detail="unsupported status")
 
-    # ---- Mark fulfilled ----
+    # ---- Mark fulfilled (idempotent) ----
     o.fulfillment_status = FulfillmentStatus.fulfilled
     if isinstance(fulfilled_on, str) and fulfilled_on:
         try:
@@ -658,24 +653,48 @@ async def soraso_webflow_style_callback(
         except Exception:
             o.fulfilled_at = func.now()
     else:
+        # If Soraso didn't give a timestamp, use now (UTC)
         o.fulfilled_at = func.now()
-
-    # Progress pipeline, clear any block
     o.blocked_code = None
     o.blocked_reason = None
     o.blocked_at = None
     if o.pipeline_status != PipelineStatus.ticketed:
         o.pipeline_status = PipelineStatus.ticketed
-    db.commit()
+    db.commit(); db.refresh(o)
 
-    # Trigger OTA callback (WaveGate → partner callback_url)
+    # ---- Build Soraso JSON to RETURN (their spec: “return json order with updated status”) ----
+    resp = build_ticketing_payload(o)  # returns {"TriggerType": "...", "Payload": {...}}
+    try:
+        pl = resp.get("Payload", {})
+        # force success fields
+        pl["Status"] = "fulfilled"
+        # prefer DB timestamp if present
+        if getattr(o, "fulfilled_at", None):
+            iso = o.fulfilled_at.isoformat().replace("+00:00", "Z")
+        else:
+            iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        pl["FulfilledOn"] = iso
+        resp["Payload"] = pl
+    except Exception:
+        # fallback: always return a minimal success object
+        resp = {
+            "TriggerType": "ecomm_order_changed",
+            "Payload": {
+                "OrderId": o.order_id,
+                "Status": "fulfilled",
+                "FulfilledOn": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            },
+        }
+
+    # ---- Kick OTA callback (WaveGate → partner callback_url) ----
     try:
         from workers.ota_callback import process_ota_callback
         background.add_task(process_ota_callback, o.id)
     except Exception:
         pass
 
-    return {**_order_summary(o), "message": "fulfillment recorded"}
+    # Return the Soraso-format JSON (so their empty POST gets the updated order)
+    return resp
 
 
 
