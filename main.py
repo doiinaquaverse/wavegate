@@ -25,13 +25,15 @@ from models import (
 from workers.ticketing import process_ticketing
 from workers.ota_callback import process_ota_callback
 from rate_limiter import partner_rate_limit
+import json
+from urllib.parse import parse_qs
 
 load_dotenv()
 
 APP_NAME = os.getenv("APP_NAME", "WaveGate")
 DEBUG = os.getenv("DEBUG", "0").lower() in ("1", "true", "yes", "on")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
-SORASO_CALLBACK_TOKEN = os.getenv("SORASO_CALLBACK_TOKEN")
+SORASO_CALLBACK_TOKEN = os.getenv("SORASO_CALLBACK_TOKEN", "").strip()
 SORASO_SITE_ID = os.getenv("SORASO_SITE_ID","").strip()
 CALLBACK_SIGNING_SECRET = os.getenv("CALLBACK_SIGNING_SECRET")
 app = FastAPI(title=APP_NAME, debug=DEBUG)
@@ -579,7 +581,12 @@ async def soraso_update_by_trace(
 # at the top of main.py
 SORASO_SITE_ID = os.getenv("SORASO_SITE_ID", "").strip()
 
-# flexible route, but enforces the env site id
+# Accept Soraso fulfill callbacks (Webflow-style path).
+# - Path accepts any {site_id} but we enforce it against SORASO_SITE_ID (404 on mismatch)
+# - Body may be JSON OR application/x-www-form-urlencoded (fallback parser)
+# - Accepted success statuses: fulfilled, success, ticketed, ok
+SUCCESS_STATUSES = {"fulfilled", "success", "ticketed", "ok"}
+
 @app.post("/v2/sites/{site_id}/orders/{external_order_id}/fulfill")
 async def soraso_webflow_style_callback(
     site_id: str,
@@ -588,19 +595,44 @@ async def soraso_webflow_style_callback(
     background: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    # Make sure the site_id in the URL matches the one Soraso assigned
+    # Enforce the Soraso-assigned site id from .env (hide with 404 if wrong)
     if SORASO_SITE_ID and site_id != SORASO_SITE_ID:
         raise HTTPException(status_code=404, detail="site not found")
 
-    # Parse body JSON
-    try:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise ValueError("payload must be an object")
-    except Exception:
+    # Optional shared-secret header for extra safety
+    if SORASO_CALLBACK_TOKEN:
+        token = request.headers.get("x-callback-token", "")
+        if token != SORASO_CALLBACK_TOKEN:
+            raise HTTPException(status_code=403, detail="forbidden")
+
+    # ---- Parse body robustly (read once) ----
+    raw = await request.body()
+    payload = None
+
+    # Try JSON first
+    if raw:
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception:
+            payload = None
+
+    # Fallback: form-encoded or querystring style
+    if not isinstance(payload, dict):
+        try:
+            # Starlette can parse form(), but using parse_qs works directly on raw bytes
+            qs = parse_qs(raw.decode("utf-8", "ignore"), keep_blank_values=True)
+            payload = {k: (v[0] if isinstance(v, list) and v else v) for k, v in qs.items()}
+        except Exception:
+            payload = {}
+
+    if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # Find the order
+    # Normalize fields
+    status_raw = (str(payload.get("status") or payload.get("Status") or "").strip().lower())
+    fulfilled_on = payload.get("FulfilledOn") or payload.get("fulfilled_on")
+
+    # ---- Find order by external_order_id ----
     o: Order | None = (
         db.query(Order)
         .filter(Order.order_id == external_order_id)
@@ -610,18 +642,16 @@ async def soraso_webflow_style_callback(
     if not o:
         raise HTTPException(status_code=404, detail="order not found")
 
-    # Check status
-    status = (payload.get("status") or "").strip().lower()
-    if status not in ("fulfilled", "success"):
-        o.blocked_code = int(payload.get("code") or 400)
-        o.blocked_reason = (payload.get("message") or payload.get("error") or "fulfillment failed")[:2000]
+    # ---- Validate status ----
+    if status_raw not in SUCCESS_STATUSES:
+        o.blocked_code = int(payload.get("code") or 400) if str(payload.get("code") or "").isdigit() else 400
+        o.blocked_reason = (payload.get("message") or payload.get("error") or f"fulfillment failed (status={status_raw or 'missing'})")[:2000]
         o.blocked_at = func.now()
         db.commit()
         raise HTTPException(status_code=400, detail="unsupported status")
 
-    # Mark fulfilled
+    # ---- Mark fulfilled ----
     o.fulfillment_status = FulfillmentStatus.fulfilled
-    fulfilled_on = payload.get("FulfilledOn") or payload.get("fulfilled_on")
     if isinstance(fulfilled_on, str) and fulfilled_on:
         try:
             o.fulfilled_at = datetime.fromisoformat(fulfilled_on.replace("Z", "+00:00"))
@@ -630,6 +660,7 @@ async def soraso_webflow_style_callback(
     else:
         o.fulfilled_at = func.now()
 
+    # Progress pipeline, clear any block
     o.blocked_code = None
     o.blocked_reason = None
     o.blocked_at = None
@@ -637,7 +668,7 @@ async def soraso_webflow_style_callback(
         o.pipeline_status = PipelineStatus.ticketed
     db.commit()
 
-    # Trigger OTA callback
+    # Trigger OTA callback (WaveGate → partner callback_url)
     try:
         from workers.ota_callback import process_ota_callback
         background.add_task(process_ota_callback, o.id)
@@ -645,6 +676,7 @@ async def soraso_webflow_style_callback(
         pass
 
     return {**_order_summary(o), "message": "fulfillment recorded"}
+
 
 
 # ---------- Legacy partner-protected fulfillment (optional) ----------
