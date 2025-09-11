@@ -1,15 +1,15 @@
-# workers/ticketing.py  (FULL FILE — paste and overwrite)
+# workers/ticketing.py  (FULL FILE — replace everything)
 
 import os, asyncio, time
 import httpx
 from sqlalchemy import func
 from db import SessionLocal
 from models import (
-    Order, PipelineStatus,
+    Order, PipelineStatus, FulfillmentStatus,
     TicketingJob, TicketingAttempt, TicketingJobStatus,
     OtaCallbackJob, OtaCallbackJobStatus,
 )
-from services.ticketing_format import build_ticketing_payload
+from services.ticketing_format import build_soraso_payload
 from retry_policy import jittered_offset, RETRY_SCHEDULE_OFFSETS
 
 FORWARDING_PAYLOAD_URL = os.getenv("FORWARDING_PAYLOAD_URL", "").strip()
@@ -91,13 +91,17 @@ async def process_ticketing(order_id: int):
             job = TicketingJob(
                 order_id=order.id,
                 trace_id=order.trace_id,
-                request_payload=build_ticketing_payload(order),
+                request_payload=build_soraso_payload(order, status="unfulfilled", wrap=True),
                 status=TicketingJobStatus.queued,
             )
             db.add(job); db.commit(); db.refresh(job)
 
         # ----- SOFT SUCCESS PATH: if no external URL, do not call out -----
         if not FORWARDING_PAYLOAD_URL:
+            # Treat as success and mark fulfilled immediately
+            order.fulfillment_status = FulfillmentStatus.fulfilled
+            order.fulfilled_at = func.now()
+            db.commit()
             await _mark_ticketed_and_callback(db, order, job)
             return
 
@@ -150,6 +154,12 @@ async def process_ticketing(order_id: int):
                 order = db.get(Order, order_id)
                 if order_ref:
                     order.ticketing_order_ref = order_ref
+
+                # Step 4 — mark fulfilled immediately on successful push
+                order.fulfillment_status = FulfillmentStatus.fulfilled
+                order.fulfilled_at = func.now()
+                db.commit()
+
                 await _mark_ticketed_and_callback(db, order, job)
                 return
 

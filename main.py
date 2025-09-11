@@ -25,10 +25,8 @@ from models import (
 from workers.ticketing import process_ticketing
 from workers.ota_callback import process_ota_callback
 from rate_limiter import partner_rate_limit
-import json
 from urllib.parse import parse_qs
-from datetime import datetime, timezone
-from services.ticketing_format import build_ticketing_payload
+from services.ticketing_format import build_soraso_payload
 
 load_dotenv()
 
@@ -199,7 +197,6 @@ def _ts_from_iso(iso: str | None) -> int:
     if not iso:
         return int(time.time())
     try:
-        from datetime import datetime
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
         return int(dt.timestamp())
     except Exception:
@@ -357,7 +354,7 @@ async def create_order(
 
     db.commit(); db.refresh(order)
 
-    # Kick ticketing in background
+    # Kick ticketing in background (this will push lowerCamel payload to Soraso)
     background.add_task(process_ticketing, order.id)
     return _order_summary(order)
 
@@ -496,6 +493,8 @@ def get_order(order_pk: int, db: Session = Depends(get_db), request: Request = N
         },
     }
 
+SUCCESS_STATUSES = {"fulfilled", "success", "ticketed", "ok"}
+
 # ---------- Soraso callbacks (no auth required by partner headers) ----------
 def _check_soraso_auth(request: Request):
     token = request.headers.get("X-Callback-Token")
@@ -525,7 +524,6 @@ def _apply_soraso_update(db: Session, o: Order, payload: dict, background: Backg
         o.blocked_reason = None
         o.blocked_at = None
 
-        # if Soraso accepted earlier, proceed to OTA callback
         if o.pipeline_status != PipelineStatus.ota_callback_pending:
             o.pipeline_status = PipelineStatus.ticketing_accepted
         db.commit()
@@ -579,8 +577,6 @@ async def soraso_update_by_trace(
     if not o:
         raise HTTPException(status_code=404, detail="order not found")
     return _apply_soraso_update(db, o, body, background)
-
-SUCCESS_STATUSES = {"fulfilled", "success", "ticketed", "ok"}
 
 @app.post("/v2/sites/{site_id}/orders/{external_order_id}/fulfill")
 async def soraso_webflow_style_callback(
@@ -665,40 +661,21 @@ async def soraso_webflow_style_callback(
         current_status = getattr(o.pipeline_status, "value", o.pipeline_status)
         if current_status != "ticketed":
             try:
-                enum_cls = type(o.pipeline_status)         # current Enum type
-                o.pipeline_status = enum_cls("ticketed")   # set via enum value
+                enum_cls = type(o.pipeline_status)
+                o.pipeline_status = enum_cls("ticketed")
             except Exception:
-                from models import PipelineStatus as PS     # fallback
+                from models import PipelineStatus as PS
                 try:
                     o.pipeline_status = PS("ticketed")
                 except Exception:
-                    pass  # leave as-is if enum lacks this member at runtime
+                    pass
     except Exception:
         pass
 
     db.commit(); db.refresh(o)
 
-    # 7) Build and RETURN Soraso-style JSON (they said: return the order with updated status)
-    resp = build_ticketing_payload(o)  # {"TriggerType": "...", "Payload": {...}}
-    try:
-        pl = dict(resp.get("Payload") or {})
-        pl["Status"] = "fulfilled"
-        if getattr(o, "fulfilled_at", None):
-            iso = o.fulfilled_at.isoformat().replace("+00:00", "Z")
-        else:
-            iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-        pl["FulfilledOn"] = iso
-        resp["Payload"] = pl
-    except Exception:
-        # Safe fallback
-        resp = {
-            "TriggerType": "ecomm_order_changed",
-            "Payload": {
-                "OrderId": o.order_id,
-                "Status": "fulfilled",
-                "FulfilledOn": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
-            },
-        }
+    # 7) Return the *inner* Soraso payload with status "fulfilled" (per your spec)
+    resp = build_soraso_payload(o, status="fulfilled", wrap=False)
 
     # 8) Trigger OTA callback ONLY if needed (avoid duplicate workers; do run when pending)
     try:
@@ -720,15 +697,12 @@ async def soraso_webflow_style_callback(
         status_val = getattr(job.status, "value", job.status)
         pipe_val = getattr(o.pipeline_status, "value", o.pipeline_status)
 
-        # Enqueue when job is new/pending or needs retry; skip if already in_progress/delivered
         if status_val in (None, "pending", "client_error", "exhausted") and pipe_val != "ota_callback_delivered":
             background.add_task(process_ota_callback, o.id)
     except Exception:
         pass
 
     return resp
-
-
 
 # ---------- Legacy partner-protected fulfillment (optional) ----------
 @app.put("/orders/{order_pk}/fulfill")
