@@ -262,18 +262,13 @@ async def log_orders_hits(request: Request, call_next):
     ptok = request.headers.get("x-partner-token")
 
     raw = await request.body()
-    raw_trunc = raw[:MAX_BODY_LOG_BYTES]
     try:
-        body_json = json.loads(raw_trunc.decode("utf-8")) if raw_trunc else None
+        body_json = json.loads(raw.decode("utf-8")) if raw else None
     except Exception:
         body_json = None
 
-    headers_dict = {
-        k: (v if k.lower() != "x-partner-token" else "***redacted***")
-        for k, v in request.headers.items()
-    }
-
-    # Provisional reason (covers cases FastAPI would reject before our handler)
+    # Provisional reason (pre-validation)
+    from models import AuthFailReason
     reason = AuthFailReason.ok
     if request.method.upper() == "POST":
         if not pid:
@@ -283,7 +278,7 @@ async def log_orders_hits(request: Request, call_next):
         elif raw and body_json is None:
             reason = AuthFailReason.invalid_json
 
-    # Re-inject body for downstream
+    # Re-inject body
     async def receive():
         return {"type": "http.request", "body": raw, "more_body": False}
     request._receive = receive  # type: ignore
@@ -291,17 +286,20 @@ async def log_orders_hits(request: Request, call_next):
     response = await call_next(request)
     status = getattr(response, "status_code", None)
 
-    # Prefer a precise reason set by handlers
     final_reason = getattr(request.state, "auth_reason", None) or reason
     if status == 429:
         final_reason = AuthFailReason.rate_limited
     if status and status >= 400 and final_reason == AuthFailReason.ok:
         final_reason = AuthFailReason.unknown
 
+    from db import SessionLocal
+    from models import AuthEvent
     db = SessionLocal()
     try:
-        # Write a single row per /orders hit
-        from models import AuthEvent  # import here to avoid circulars
+        headers_dict = {k: (v if k.lower() != "x-partner-token" else "***redacted***")
+                        for k, v in request.headers.items()}
+
+        # Attempt full insert
         db.add(AuthEvent(
             partner_id=pid,
             ip=ip,
@@ -312,17 +310,32 @@ async def log_orders_hits(request: Request, call_next):
             status_code=status,
             headers=headers_dict,
             body=body_json,
-            body_truncated=(len(raw) > MAX_BODY_LOG_BYTES),
+            body_truncated=(len(raw) > 8192),
         ))
         db.commit()
-    except Exception:
+    except Exception as e:
+        # Log error so we can see exactly why it failed
+        print(f"[auth_events] full insert failed: {e}", flush=True)
         db.rollback()
-    finally:
+        try:
+            # Minimal fallback insert (only legacy cols)
+            db.add(AuthEvent(
+                partner_id=pid,
+                ip=ip,
+                reason=AuthFailReason.unknown,  # safe even if a CHECK exists on old installs
+                user_agent=ua,
+            ))
+            db.commit()
+        except Exception as e2:
+            print(f"[auth_events] fallback insert failed: {e2}", flush=True)
+            db.rollback()
+        finally:
+            db.close()
+    else:
         db.close()
 
     return response
 
-# ---------------- API ----------------
 
 @app.post("/orders")
 async def create_order(
@@ -865,3 +878,24 @@ def debug_ip(request: Request):
         "detected": _client_ip(request),
         "trusted_proxy_peer": _trusted_proxy_peer(request.client.host if request.client else ""),
     }
+
+@app.post("/debug/force-auth-event")
+def debug_force_auth_event(request: Request):
+    from db import SessionLocal
+    from models import AuthEvent, AuthFailReason
+    db = SessionLocal()
+    try:
+        db.add(AuthEvent(
+            partner_id=request.headers.get("x-partner-id"),
+            ip=_client_ip(request),
+            reason=AuthFailReason.unknown,
+            user_agent=request.headers.get("user-agent"),
+        ))
+        db.commit()
+        return {"ok": True}
+    except Exception as e:
+        db.rollback()
+        print(f"[auth_events] debug insert failed: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=f"debug insert failed: {e}")
+    finally:
+        db.close()
