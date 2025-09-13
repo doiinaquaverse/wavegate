@@ -257,7 +257,7 @@ async def log_orders_hits(request: Request, call_next):
         return await call_next(request)
 
     ip = _client_ip(request)
-    ua = request.headers.get("user-agent")
+    ua = request.headers.get("user-agent") or ""
     pid = request.headers.get("x-partner-id")
     ptok = request.headers.get("x-partner-token")
 
@@ -267,7 +267,6 @@ async def log_orders_hits(request: Request, call_next):
     except Exception:
         body_json = None
 
-    # Provisional reason (pre-validation)
     from models import AuthFailReason
     reason = AuthFailReason.ok
     if request.method.upper() == "POST":
@@ -278,7 +277,6 @@ async def log_orders_hits(request: Request, call_next):
         elif raw and body_json is None:
             reason = AuthFailReason.invalid_json
 
-    # Re-inject body
     async def receive():
         return {"type": "http.request", "body": raw, "more_body": False}
     request._receive = receive  # type: ignore
@@ -296,10 +294,9 @@ async def log_orders_hits(request: Request, call_next):
     from models import AuthEvent
     db = SessionLocal()
     try:
+        # try full insert (rich columns)
         headers_dict = {k: (v if k.lower() != "x-partner-token" else "***redacted***")
                         for k, v in request.headers.items()}
-
-        # Attempt full insert
         db.add(AuthEvent(
             partner_id=pid,
             ip=ip,
@@ -314,20 +311,32 @@ async def log_orders_hits(request: Request, call_next):
         ))
         db.commit()
     except Exception as e:
-        # Log error so we can see exactly why it failed
-        print(f"[auth_events] full insert failed: {e}", flush=True)
+        # Fallback: legacy columns ONLY, but embed details in user_agent safely
         db.rollback()
         try:
-            # Minimal fallback insert (only legacy cols)
+            # Pack rich info into user_agent so you can see everything even if columns/constraints block the rich insert.
+            headers_redacted = {k: (v if k.lower() != "x-partner-token" else "***redacted***")
+                                for k, v in request.headers.items()}
+            packed = {
+                "method": request.method,
+                "path": request.url.path,
+                "status": status,
+                "headers": headers_redacted,
+                "body": body_json,
+            }
+            # keep it short-ish to avoid hitting any varchar/text limits
+            packed_str = json.dumps(packed, separators=(",", ":"))[:1900]
+            ua_embedded = (ua + " | LOG=" + packed_str)[:2000]
+
+            # strict installs may have a CHECK on reason → use 'unknown' to guarantee insert
             db.add(AuthEvent(
                 partner_id=pid,
                 ip=ip,
-                reason=AuthFailReason.unknown,  # safe even if a CHECK exists on old installs
-                user_agent=ua,
+                reason=AuthFailReason.unknown,
+                user_agent=ua_embedded,
             ))
             db.commit()
         except Exception as e2:
-            print(f"[auth_events] fallback insert failed: {e2}", flush=True)
             db.rollback()
         finally:
             db.close()
@@ -335,6 +344,7 @@ async def log_orders_hits(request: Request, call_next):
         db.close()
 
     return response
+
 
 
 @app.post("/orders")
@@ -899,3 +909,24 @@ def debug_force_auth_event(request: Request):
         raise HTTPException(status_code=500, detail=f"debug insert failed: {e}")
     finally:
         db.close()
+
+@app.get("/debug/dbinfo")
+def debug_dbinfo(db: Session = Depends(get_db)):
+    r = db.execute("SELECT current_database(), current_user, version(), now()").fetchone()
+    return {
+        "current_database": r[0],
+        "current_user": r[1],
+        "version": r[2],
+        "now": str(r[3]),
+    }
+
+@app.get("/debug/auth-events")
+def debug_auth_events(limit: int = 5, db: Session = Depends(get_db)):
+    rows = db.execute("""
+        SELECT id, created_at, partner_id, reason::text AS reason,
+               method, path, status_code, user_agent
+        FROM auth_events
+        ORDER BY id DESC
+        LIMIT :lim
+    """, {"lim": limit}).fetchall()
+    return [dict(row._mapping) for row in rows]
