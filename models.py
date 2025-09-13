@@ -318,6 +318,51 @@ class IdempotencyKey(Base):
 
     order: Mapped["Order"] = relationship(back_populates="idempotency_keys")
 
+# ---------------- PartnerRegistration (restored) ----------------
+
+class PartnerRegistration(Base):
+    __tablename__ = "partner_registrations"
+    __table_args__ = (
+        Index("ix_partner_reg_created_at", "created_at"),
+        Index("ix_partner_reg_company", "company"),
+        Index("ix_partner_reg_contact_email", "contactEmail"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    reference: Mapped[Optional[str]] = mapped_column(String(200))
+
+    company: Mapped[Optional[str]] = mapped_column(String(255))
+    website: Mapped[Optional[str]] = mapped_column(String(255))
+    country: Mapped[Optional[str]] = mapped_column(String(128))
+    address: Mapped[Optional[str]] = mapped_column(Text)
+    taxId: Mapped[Optional[str]] = mapped_column(String(128))
+
+    contactName: Mapped[Optional[str]] = mapped_column(String(255))
+    contactEmail: Mapped[Optional[str]] = mapped_column(String(320))
+    contactPhone: Mapped[Optional[str]] = mapped_column(String(64))
+
+    techName: Mapped[Optional[str]] = mapped_column(String(255))
+    techEmail: Mapped[Optional[str]] = mapped_column(String(320))
+    techPhone: Mapped[Optional[str]] = mapped_column(String(64))
+
+    vol: Mapped[Optional[str]] = mapped_column(String(64))
+    rps: Mapped[Optional[str]] = mapped_column(String(64))
+    launch: Mapped[Optional[str]] = mapped_column(String(64))
+    tz: Mapped[Optional[str]] = mapped_column(String(64))
+    desc: Mapped[Optional[str]] = mapped_column(Text)
+    auth: Mapped[Optional[str]] = mapped_column(String(128))
+    env: Mapped[Optional[str]] = mapped_column(String(64))
+    webhook: Mapped[Optional[str]] = mapped_column(Text)
+    ips: Mapped[Optional[str]] = mapped_column(Text)
+    arch: Mapped[Optional[str]] = mapped_column(Text)
+    demo: Mapped[Optional[str]] = mapped_column(String(64))
+
+    usecase: Mapped[Optional[dict]] = mapped_column(JSON)       # often a list[] but JSON covers it
+    compliance: Mapped[Optional[dict]] = mapped_column(JSON)
+    raw: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+
 # ---------------- AuthEvents ----------------
 
 class AuthEvent(Base):
@@ -335,7 +380,7 @@ class AuthEvent(Base):
     user_agent: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
 
-    # NEW metadata captured by /orders ingress logging
+    # metadata captured by /orders ingress logging
     method: Mapped[Optional[str]] = mapped_column(String(10))
     path: Mapped[Optional[str]] = mapped_column(String(512))
     status_code: Mapped[Optional[int]] = mapped_column(Integer)
