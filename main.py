@@ -44,6 +44,20 @@ bangkok_timezone = timezone(timedelta(hours=7))
 # Trust only these proxy CIDRs when reading client IP headers
 TRUSTED_PROXY_CIDRS = os.getenv("TRUSTED_PROXY_CIDRS", "")
 
+@app.middleware("http")
+async def _mw_probe(request, call_next):
+    if request.url.path.startswith("/orders"):
+        # mark the response so we can see the middleware definitely ran
+        try:
+            resp = await call_next(request)
+        except Exception as e:
+            # even if it raises (422), fabricate a response just to set a header
+            from fastapi.responses import JSONResponse
+            resp = JSONResponse({"detail": "probe"}, status_code=422)
+        resp.headers["X-Orders-Logger"] = "on"
+        return resp
+    return await call_next(request)
+
 # ---------------- Health ----------------
 @app.get("/health")
 async def health():
