@@ -47,6 +47,8 @@ TRUSTED_PROXY_CIDRS = os.getenv("TRUSTED_PROXY_CIDRS", "")
 # =====================================================================
 # MIDDLEWARE: Log EVERY hit to /orders (even if validation raises 422)
 # =====================================================================
+from sqlalchemy import text  # ensure this import exists near your other imports
+
 @app.middleware("http")
 async def log_orders_hits(request: Request, call_next):
     if not request.url.path.startswith("/orders"):
@@ -59,7 +61,6 @@ async def log_orders_hits(request: Request, call_next):
     ptok = request.headers.get("x-partner-token")
 
     raw = await request.body()
-    body_json = None
     try:
         body_json = json.loads(raw.decode("utf-8")) if raw else None
     except Exception:
@@ -101,14 +102,15 @@ async def log_orders_hits(request: Request, call_next):
         if status and status >= 400 and final_reason == AuthFailReason.ok:
             final_reason = AuthFailReason.unknown
 
-        # try full rich insert; on failure, fallback to a minimal row
+        headers_dict = {
+            k: (v if k.lower() != "x-partner-token" else "***redacted***")
+            for k, v in request.headers.items()
+        }
+
         db = SessionLocal()
         try:
+            # 1) Try full rich insert with the precise reason
             from models import AuthEvent
-            headers_dict = {
-                k: (v if k.lower() != "x-partner-token" else "***redacted***")
-                for k, v in request.headers.items()
-            }
             db.add(AuthEvent(
                 partner_id=pid,
                 ip=ip,
@@ -122,34 +124,58 @@ async def log_orders_hits(request: Request, call_next):
                 body_truncated=(len(raw) > MAX_BODY_LOG_BYTES),
             ))
             db.commit()
+
         except Exception as e:
-            # print why full insert failed (schema/enum issues) and fallback
-            print(f"[auth_events] ORM insert failed: {e}", flush=True)
+            msg = str(e)
+            print(f"[auth_events] ORM insert failed: {msg}", flush=True)
             db.rollback()
-            try:
-                # minimal/legacy-safe row; embed details (short) into user_agent so you still see them
-                packed = {
-                    "m": request.method,
-                    "p": request.url.path,
-                    "s": status,
-                }
+
+            # 2) If it failed because 'reason' is too long for VARCHAR(10),
+            #    retry a rich insert but with reason=unknown to satisfy the column length/old CHECK.
+            retried = False
+            if "value too long for type character varying(10)" in msg or "character varying(10)" in msg:
                 try:
-                    if body_json is None and raw:
-                        # small peek, up to 256 bytes
-                        packed["raw"] = raw[:256].decode("utf-8", "ignore")
-                except Exception:
-                    pass
-                ua_embedded = (ua + " | LOG=" + json.dumps(packed, separators=(",", ":")))[:2000]
-                db.execute(
-                    "INSERT INTO auth_events (partner_id, ip, reason, user_agent) "
-                    "VALUES (:pid, :ip, :reason, :ua)",
-                    {"pid": pid, "ip": ip, "reason": "unknown", "ua": ua_embedded},
-                )
-                db.commit()
-            except Exception as e2:
-                print(f"[auth_events] RAW insert failed: {e2}", flush=True)
-                db.rollback()
-            finally:
+                    db.add(AuthEvent(
+                        partner_id=pid,
+                        ip=ip,
+                        reason=AuthFailReason.unknown,
+                        user_agent=ua,
+                        method=request.method,
+                        path=request.url.path,
+                        status_code=status,
+                        headers=headers_dict,
+                        body=body_json,
+                        body_truncated=(len(raw) > MAX_BODY_LOG_BYTES),
+                    ))
+                    db.commit()
+                    retried = True
+                except Exception as e_retry:
+                    print(f"[auth_events] ORM retry (reason=unknown) failed: {e_retry}", flush=True)
+                    db.rollback()
+
+            if not retried:
+                # 3) RAW minimal fallback (always succeeds on legacy schema).
+                try:
+                    packed = {"m": request.method, "p": request.url.path, "s": status}
+                    try:
+                        if body_json is None and raw:
+                            packed["raw"] = raw[:256].decode("utf-8", "ignore")
+                    except Exception:
+                        pass
+                    ua_embedded = (ua + " | LOG=" + json.dumps(packed, separators=(",", ":")))[:2000]
+
+                    db.execute(
+                        text("INSERT INTO auth_events (partner_id, ip, reason, user_agent) "
+                             "VALUES (:pid, :ip, :reason, :ua)"),
+                        {"pid": pid, "ip": ip, "reason": "unknown", "ua": ua_embedded},
+                    )
+                    db.commit()
+                except Exception as e2:
+                    print(f"[auth_events] RAW insert failed: {e2}", flush=True)
+                    db.rollback()
+                finally:
+                    db.close()
+            else:
                 db.close()
         else:
             db.close()
