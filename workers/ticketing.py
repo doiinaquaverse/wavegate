@@ -149,7 +149,7 @@ async def process_ticketing(order_id: int):
                 job.response_payload = {"raw": body[:200000]}
             db.commit()
 
-            success = bool(code and 200 <= code < 300 and (ACCEPT_ANY_2XX or body or order_ref))
+            success = bool(code and 200 <= code < 300)
             if success:
                 order = db.get(Order, order_id)
                 if order_ref:
