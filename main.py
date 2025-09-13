@@ -44,19 +44,115 @@ bangkok_timezone = timezone(timedelta(hours=7))
 # Trust only these proxy CIDRs when reading client IP headers
 TRUSTED_PROXY_CIDRS = os.getenv("TRUSTED_PROXY_CIDRS", "")
 
+# =====================================================================
+# MIDDLEWARE: Log EVERY hit to /orders (even if validation raises 422)
+# =====================================================================
 @app.middleware("http")
-async def _mw_probe(request, call_next):
-    if request.url.path.startswith("/orders"):
-        # mark the response so we can see the middleware definitely ran
-        try:
-            resp = await call_next(request)
-        except Exception as e:
-            # even if it raises (422), fabricate a response just to set a header
-            from fastapi.responses import JSONResponse
-            resp = JSONResponse({"detail": "probe"}, status_code=422)
-        resp.headers["X-Orders-Logger"] = "on"
+async def log_orders_hits(request: Request, call_next):
+    if not request.url.path.startswith("/orders"):
+        return await call_next(request)
+
+    # --- capture request up front
+    ip = _client_ip(request)
+    ua = request.headers.get("user-agent") or ""
+    pid = request.headers.get("x-partner-id")
+    ptok = request.headers.get("x-partner-token")
+
+    raw = await request.body()
+    body_json = None
+    try:
+        body_json = json.loads(raw.decode("utf-8")) if raw else None
+    except Exception:
+        body_json = None
+
+    # --- provisional reason BEFORE FastAPI validation runs
+    reason = AuthFailReason.ok
+    if request.method.upper() == "POST":
+        if not pid:
+            reason = AuthFailReason.missing_partner_id
+        elif not ptok:
+            reason = AuthFailReason.missing_partner_token
+        elif raw and body_json is None:
+            reason = AuthFailReason.invalid_json
+
+    # re-inject body so downstream can read it
+    async def receive():
+        return {"type": "http.request", "body": raw, "more_body": False}
+    request._receive = receive  # type: ignore
+
+    status = None
+    try:
+        resp = await call_next(request)
+        status = getattr(resp, "status_code", None)
         return resp
-    return await call_next(request)
+    except Exception as exc:
+        # map to status code (HTTPException vs generic)
+        try:
+            from fastapi import HTTPException as _HTTPException
+            status = exc.status_code if isinstance(exc, _HTTPException) else 500
+        except Exception:
+            status = 500
+        raise
+    finally:
+        # prefer a reason set later by the handler
+        final_reason = getattr(request.state, "auth_reason", None) or reason
+        if status == 429:
+            final_reason = AuthFailReason.rate_limited
+        if status and status >= 400 and final_reason == AuthFailReason.ok:
+            final_reason = AuthFailReason.unknown
+
+        # try full rich insert; on failure, fallback to a minimal row
+        db = SessionLocal()
+        try:
+            from models import AuthEvent
+            headers_dict = {
+                k: (v if k.lower() != "x-partner-token" else "***redacted***")
+                for k, v in request.headers.items()
+            }
+            db.add(AuthEvent(
+                partner_id=pid,
+                ip=ip,
+                reason=final_reason,
+                user_agent=ua,
+                method=request.method,
+                path=request.url.path,
+                status_code=status,
+                headers=headers_dict,
+                body=body_json,
+                body_truncated=(len(raw) > MAX_BODY_LOG_BYTES),
+            ))
+            db.commit()
+        except Exception as e:
+            # print why full insert failed (schema/enum issues) and fallback
+            print(f"[auth_events] ORM insert failed: {e}", flush=True)
+            db.rollback()
+            try:
+                # minimal/legacy-safe row; embed details (short) into user_agent so you still see them
+                packed = {
+                    "m": request.method,
+                    "p": request.url.path,
+                    "s": status,
+                }
+                try:
+                    if body_json is None and raw:
+                        # small peek, up to 256 bytes
+                        packed["raw"] = raw[:256].decode("utf-8", "ignore")
+                except Exception:
+                    pass
+                ua_embedded = (ua + " | LOG=" + json.dumps(packed, separators=(",", ":")))[:2000]
+                db.execute(
+                    "INSERT INTO auth_events (partner_id, ip, reason, user_agent) "
+                    "VALUES (:pid, :ip, :reason, :ua)",
+                    {"pid": pid, "ip": ip, "reason": "unknown", "ua": ua_embedded},
+                )
+                db.commit()
+            except Exception as e2:
+                print(f"[auth_events] RAW insert failed: {e2}", flush=True)
+                db.rollback()
+            finally:
+                db.close()
+        else:
+            db.close()
 
 # ---------------- Health ----------------
 @app.get("/health")
@@ -263,123 +359,7 @@ def require_admin(request: Request):
     if not ADMIN_TOKEN or request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-# ---------------- Middleware: log every /orders hit into auth_events ----------------
-@app.middleware("http")
-async def log_orders_hits(request: Request, call_next):
-    if not request.url.path.startswith("/orders"):
-        return await call_next(request)
-
-    from db import SessionLocal
-    from models import AuthFailReason
-
-    # --- capture request early ---
-    ip = _client_ip(request)
-    ua = request.headers.get("user-agent") or ""
-    pid = request.headers.get("x-partner-id")
-    ptok = request.headers.get("x-partner-token")
-
-    raw = await request.body()
-    try:
-        body_json = json.loads(raw.decode("utf-8")) if raw else None
-    except Exception:
-        body_json = None
-
-    # pre-validation reason (covers 422/400 paths)
-    reason = AuthFailReason.ok
-    if request.method.upper() == "POST":
-        if not pid:
-            reason = AuthFailReason.missing_partner_id
-        elif not ptok:
-            reason = AuthFailReason.missing_partner_token
-        elif raw and body_json is None:
-            reason = AuthFailReason.invalid_json
-
-    # re-inject body for downstream
-    async def receive():
-        return {"type": "http.request", "body": raw, "more_body": False}
-    request._receive = receive  # type: ignore
-
-    # run request
-    status = None
-    try:
-        response = await call_next(request)
-        status = getattr(response, "status_code", None)
-        return response
-    except Exception as exc:
-        try:
-            from fastapi import HTTPException
-            status = exc.status_code if isinstance(exc, HTTPException) else 500
-        except Exception:
-            status = 500
-        raise
-    finally:
-        # prefer a more precise reason from downstream
-        final_reason = getattr(request.state, "auth_reason", None) or reason
-        if status == 429:
-            final_reason = AuthFailReason.rate_limited
-        if status and status >= 400 and final_reason == AuthFailReason.ok:
-            final_reason = AuthFailReason.unknown
-
-        headers_dict = {
-            k: (v if k.lower() != "x-partner-token" else "***redacted***")
-            for k, v in request.headers.items()
-        }
-
-        db = SessionLocal()
-        try:
-            # Attempt A: rich insert with computed reason
-            from models import AuthEvent
-            db.add(AuthEvent(
-                partner_id=pid,
-                ip=ip,
-                reason=final_reason,
-                user_agent=ua,
-                method=request.method,
-                path=request.url.path,
-                status_code=status,
-                headers=headers_dict,
-                body=body_json,
-                body_truncated=(len(raw) > MAX_BODY_LOG_BYTES),
-            ))
-            db.commit()
-        except Exception as eA:
-            print(f"[auth_events] A (rich w/ reason={getattr(final_reason,'value',str(final_reason))}) failed: {eA}", flush=True)
-            db.rollback()
-            try:
-                # Attempt B: rich insert but force reason='unknown'
-                from models import AuthEvent
-                db.add(AuthEvent(
-                    partner_id=pid,
-                    ip=ip,
-                    reason=AuthFailReason.unknown,
-                    user_agent=ua,
-                    method=request.method,
-                    path=request.url.path,
-                    status_code=status,
-                    headers=headers_dict,
-                    body=body_json,
-                    body_truncated=(len(raw) > MAX_BODY_LOG_BYTES),
-                ))
-                db.commit()
-            except Exception as eB:
-                print(f"[auth_events] B (rich w/ reason=unknown) failed: {eB}", flush=True)
-                db.rollback()
-                try:
-                    # Attempt C: minimal legacy insert (guaranteed on oldest schema)
-                    db.execute(
-                        "INSERT INTO auth_events (partner_id, ip, reason, user_agent) "
-                        "VALUES (:pid, :ip, :reason, :ua)",
-                        {"pid": pid, "ip": ip, "reason": "unknown", "ua": ua},
-                    )
-                    db.commit()
-                except Exception as eC:
-                    print(f"[auth_events] C (minimal legacy) failed: {eC}", flush=True)
-                    db.rollback()
-                finally:
-                    db.close()
-        else:
-            db.close()
-# ---------------- Order endpoints ----------------
+# ---------------- Partner/Orders APIs (unchanged) ----------------
 
 @app.post("/orders")
 async def create_order(
@@ -770,9 +750,9 @@ async def soraso_webflow_style_callback(
         raise HTTPException(status_code=400, detail="unsupported status")
 
     o.fulfillment_status = FulfillmentStatus.fulfilled
-    if isinstance(fulfilled_on, str) and fulfilled_on:
+    if isinstance(FulfilledOn := payload.get("FulfilledOn") or payload.get("fulfilled_on"), str) and FulfilledOn:
         try:
-            o.fulfilled_at = datetime.fromisoformat(fulfilled_on.replace("Z", "+00:00"))
+            o.fulfilled_at = datetime.fromisoformat(FulfilledOn.replace("Z", "+00:00"))
         except Exception:
             o.fulfilled_at = func.now()
     else:
