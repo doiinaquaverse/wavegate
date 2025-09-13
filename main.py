@@ -264,12 +264,15 @@ def require_admin(request: Request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 # ---------------- Middleware: log every /orders hit into auth_events ----------------
-
 @app.middleware("http")
 async def log_orders_hits(request: Request, call_next):
     if not request.url.path.startswith("/orders"):
         return await call_next(request)
 
+    from db import SessionLocal
+    from models import AuthFailReason
+
+    # --- capture request early ---
     ip = _client_ip(request)
     ua = request.headers.get("user-agent") or ""
     pid = request.headers.get("x-partner-id")
@@ -281,7 +284,7 @@ async def log_orders_hits(request: Request, call_next):
     except Exception:
         body_json = None
 
-    from models import AuthFailReason
+    # pre-validation reason (covers 422/400 paths)
     reason = AuthFailReason.ok
     if request.method.upper() == "POST":
         if not pid:
@@ -291,75 +294,92 @@ async def log_orders_hits(request: Request, call_next):
         elif raw and body_json is None:
             reason = AuthFailReason.invalid_json
 
+    # re-inject body for downstream
     async def receive():
         return {"type": "http.request", "body": raw, "more_body": False}
     request._receive = receive  # type: ignore
 
-    response = await call_next(request)
-    status = getattr(response, "status_code", None)
-
-    final_reason = getattr(request.state, "auth_reason", None) or reason
-    if status == 429:
-        final_reason = AuthFailReason.rate_limited
-    if status and status >= 400 and final_reason == AuthFailReason.ok:
-        final_reason = AuthFailReason.unknown
-
-    from db import SessionLocal
-    from models import AuthEvent
-    db = SessionLocal()
+    # run request
+    status = None
     try:
-        # try full insert (rich columns)
-        headers_dict = {k: (v if k.lower() != "x-partner-token" else "***redacted***")
-                        for k, v in request.headers.items()}
-        db.add(AuthEvent(
-            partner_id=pid,
-            ip=ip,
-            reason=final_reason,
-            user_agent=ua,
-            method=request.method,
-            path=request.url.path,
-            status_code=status,
-            headers=headers_dict,
-            body=body_json,
-            body_truncated=(len(raw) > 8192),
-        ))
-        db.commit()
-    except Exception as e:
-        # Fallback: legacy columns ONLY, but embed details in user_agent safely
-        db.rollback()
+        response = await call_next(request)
+        status = getattr(response, "status_code", None)
+        return response
+    except Exception as exc:
         try:
-            # Pack rich info into user_agent so you can see everything even if columns/constraints block the rich insert.
-            headers_redacted = {k: (v if k.lower() != "x-partner-token" else "***redacted***")
-                                for k, v in request.headers.items()}
-            packed = {
-                "method": request.method,
-                "path": request.url.path,
-                "status": status,
-                "headers": headers_redacted,
-                "body": body_json,
-            }
-            # keep it short-ish to avoid hitting any varchar/text limits
-            packed_str = json.dumps(packed, separators=(",", ":"))[:1900]
-            ua_embedded = (ua + " | LOG=" + packed_str)[:2000]
+            from fastapi import HTTPException
+            status = exc.status_code if isinstance(exc, HTTPException) else 500
+        except Exception:
+            status = 500
+        raise
+    finally:
+        # prefer a more precise reason from downstream
+        final_reason = getattr(request.state, "auth_reason", None) or reason
+        if status == 429:
+            final_reason = AuthFailReason.rate_limited
+        if status and status >= 400 and final_reason == AuthFailReason.ok:
+            final_reason = AuthFailReason.unknown
 
-            # strict installs may have a CHECK on reason → use 'unknown' to guarantee insert
+        headers_dict = {
+            k: (v if k.lower() != "x-partner-token" else "***redacted***")
+            for k, v in request.headers.items()
+        }
+
+        db = SessionLocal()
+        try:
+            # Attempt A: rich insert with computed reason
+            from models import AuthEvent
             db.add(AuthEvent(
                 partner_id=pid,
                 ip=ip,
-                reason=AuthFailReason.unknown,
-                user_agent=ua_embedded,
+                reason=final_reason,
+                user_agent=ua,
+                method=request.method,
+                path=request.url.path,
+                status_code=status,
+                headers=headers_dict,
+                body=body_json,
+                body_truncated=(len(raw) > MAX_BODY_LOG_BYTES),
             ))
             db.commit()
-        except Exception as e2:
+        except Exception as eA:
+            print(f"[auth_events] A (rich w/ reason={getattr(final_reason,'value',str(final_reason))}) failed: {eA}", flush=True)
             db.rollback()
-        finally:
+            try:
+                # Attempt B: rich insert but force reason='unknown'
+                from models import AuthEvent
+                db.add(AuthEvent(
+                    partner_id=pid,
+                    ip=ip,
+                    reason=AuthFailReason.unknown,
+                    user_agent=ua,
+                    method=request.method,
+                    path=request.url.path,
+                    status_code=status,
+                    headers=headers_dict,
+                    body=body_json,
+                    body_truncated=(len(raw) > MAX_BODY_LOG_BYTES),
+                ))
+                db.commit()
+            except Exception as eB:
+                print(f"[auth_events] B (rich w/ reason=unknown) failed: {eB}", flush=True)
+                db.rollback()
+                try:
+                    # Attempt C: minimal legacy insert (guaranteed on oldest schema)
+                    db.execute(
+                        "INSERT INTO auth_events (partner_id, ip, reason, user_agent) "
+                        "VALUES (:pid, :ip, :reason, :ua)",
+                        {"pid": pid, "ip": ip, "reason": "unknown", "ua": ua},
+                    )
+                    db.commit()
+                except Exception as eC:
+                    print(f"[auth_events] C (minimal legacy) failed: {eC}", flush=True)
+                    db.rollback()
+                finally:
+                    db.close()
+        else:
             db.close()
-    else:
-        db.close()
-
-    return response
-
-
+# ---------------- Order endpoints ----------------
 
 @app.post("/orders")
 async def create_order(
