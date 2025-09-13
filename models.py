@@ -32,7 +32,7 @@ class FulfillmentStatus(enum.Enum):
 class TicketingJobStatus(enum.Enum):
     queued = "queued"
     in_progress = "in_progress"
-    ticketed = "ticketed"     # kept label, means Soraso accepted (2xx)
+    ticketed = "ticketed"     # Soraso accepted (2xx)
     client_error = "client_error"
     exhausted = "exhausted"
 
@@ -44,10 +44,21 @@ class OtaCallbackJobStatus(enum.Enum):
     exhausted = "exhausted"
 
 class AuthFailReason(enum.Enum):
+    # legacy
     no_partner = "no_partner"
     inactive = "inactive"
     bad_token = "bad_token"
     ip_block = "ip_block"
+    # new granular reasons for /orders ingress
+    ok = "ok"  # successful request to /orders
+    missing_partner_id = "missing_partner_id"
+    missing_partner_token = "missing_partner_token"
+    invalid_json = "invalid_json"
+    invalid_callback_url = "invalid_callback_url"
+    callback_host_blocked = "callback_host_blocked"
+    callback_domain_disallowed = "callback_domain_disallowed"
+    rate_limited = "rate_limited"
+    unknown = "unknown"
 
 # ---------------- Partners ----------------
 
@@ -324,43 +335,10 @@ class AuthEvent(Base):
     user_agent: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
 
-# ---------------- Partner Registrations ----------------
-
-class PartnerRegistration(Base):
-    __tablename__ = "partners_registration"
-    __table_args__ = (
-        Index("ix_partners_registration_company", "company"),
-        Index("ix_partners_registration_contact_email", "contactEmail"),
-        Index("ix_partners_registration_created_at", "created_at"),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
-
-    reference: Mapped[Optional[str]] = mapped_column(String(255))
-    company: Mapped[Optional[str]] = mapped_column(String(255))
-    website: Mapped[Optional[str]] = mapped_column(Text)
-    country: Mapped[Optional[str]] = mapped_column(String(64))
-    address: Mapped[Optional[str]] = mapped_column(Text)
-    taxId: Mapped[Optional[str]] = mapped_column(String(128))
-    contactName: Mapped[Optional[str]] = mapped_column(String(255))
-    contactEmail: Mapped[Optional[str]] = mapped_column(String(320))
-    contactPhone: Mapped[Optional[str]] = mapped_column(String(128))
-    techName: Mapped[Optional[str]] = mapped_column(String(255))
-    techEmail: Mapped[Optional[str]] = mapped_column(String(320))
-    techPhone: Mapped[Optional[str]] = mapped_column(String(128))
-    vol: Mapped[Optional[str]] = mapped_column(String(128))
-    rps: Mapped[Optional[str]] = mapped_column(String(128))
-    launch: Mapped[Optional[str]] = mapped_column(String(128))
-    tz: Mapped[Optional[str]] = mapped_column(String(64))
-    desc: Mapped[Optional[str]] = mapped_column(Text)
-    auth: Mapped[Optional[str]] = mapped_column(String(64))
-    env: Mapped[Optional[str]] = mapped_column(String(64))
-    webhook: Mapped[Optional[str]] = mapped_column(Text)
-    ips: Mapped[Optional[str]] = mapped_column(Text)
-    arch: Mapped[Optional[str]] = mapped_column(Text)
-    demo: Mapped[Optional[str]] = mapped_column(Text)
-    usecase: Mapped[Optional[list]] = mapped_column(JSON)
-    compliance: Mapped[Optional[dict]] = mapped_column(JSON)
-
-    raw: Mapped[Optional[dict]] = mapped_column(JSON)
+    # NEW metadata captured by /orders ingress logging
+    method: Mapped[Optional[str]] = mapped_column(String(10))
+    path: Mapped[Optional[str]] = mapped_column(String(512))
+    status_code: Mapped[Optional[int]] = mapped_column(Integer)
+    headers: Mapped[Optional[dict]] = mapped_column(JSON)
+    body: Mapped[Optional[dict]] = mapped_column(JSON)
+    body_truncated: Mapped[Optional[bool]] = mapped_column()

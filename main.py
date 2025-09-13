@@ -6,7 +6,7 @@ import socket
 import ipaddress
 import asyncio
 import hmac, hashlib, json
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone, timedelta
 from typing import Iterable, Set, Optional, List
 
@@ -16,16 +16,15 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from db import get_db
+from db import get_db, SessionLocal
 from models import (
     Order, OrderItem, Partner, PartnerStatus,
     IdempotencyKey, PipelineStatus, FulfillmentStatus,
-    PartnerRegistration, AuthEvent, AuthFailReason,
+    PartnerRegistration, AuthFailReason,
 )
 from workers.ticketing import process_ticketing
 from workers.ota_callback import process_ota_callback
 from rate_limiter import partner_rate_limit
-from urllib.parse import parse_qs
 from services.ticketing_format import build_soraso_payload
 
 load_dotenv()
@@ -36,6 +35,9 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 SORASO_CALLBACK_TOKEN = os.getenv("SORASO_CALLBACK_TOKEN", "").strip()
 SORASO_SITE_ID = os.getenv("SORASO_SITE_ID","").strip()
 CALLBACK_SIGNING_SECRET = os.getenv("CALLBACK_SIGNING_SECRET")
+
+MAX_BODY_LOG_BYTES = int(os.getenv("MAX_BODY_LOG_BYTES", "8192"))
+
 app = FastAPI(title=APP_NAME, debug=DEBUG)
 bangkok_timezone = timezone(timedelta(hours=7))
 
@@ -94,14 +96,6 @@ def _client_ip(request: Request) -> str:
                 pass
     return peer or ""
 
-def enforce_ip_allowlist(request: Request, allowlist_source_cidrs: str | None) -> None:
-    cidrs = _csv_set(allowlist_source_cidrs)
-    if not cidrs:
-        return
-    ip = _client_ip(request)
-    if not _ip_in_cidrs(ip, cidrs):
-        raise HTTPException(status_code=403, detail="Source IP not allowed")
-
 def _is_private_or_loopback_host(host: str) -> bool:
     try:
         infos = socket.getaddrinfo(host, None, 0, 0, 0, socket.AI_ADDRCONFIG)
@@ -146,22 +140,17 @@ def validate_callback_url(url: str, allowlist_domains: str | None) -> str:
 
 # ---------------- Auth ----------------
 async def verify_partner(db: Session, request: Request, partner_id: str, partner_token: str) -> Partner:
-    def _log(reason: AuthFailReason):
-        db.add(AuthEvent(
-            partner_id=partner_id,
-            ip=_client_ip(request),
-            reason=reason,
-            user_agent=request.headers.get("user-agent"),
-        ))
-        db.commit()
-
+    # NOTE: we no longer write to auth_events here; the middleware logs one row per hit.
     p: Partner | None = db.query(Partner).filter(Partner.partner_id == partner_id).first()
     if not p:
-        _log(AuthFailReason.no_partner); raise HTTPException(status_code=401, detail="Unauthorized")
+        request.state.auth_reason = AuthFailReason.no_partner
+        raise HTTPException(status_code=401, detail="Unauthorized")
     if p.status != PartnerStatus.active:
-        _log(AuthFailReason.inactive); raise HTTPException(status_code=401, detail="Unauthorized")
+        request.state.auth_reason = AuthFailReason.inactive
+        raise HTTPException(status_code=401, detail="Unauthorized")
     if p.partner_token != partner_token:
-        _log(AuthFailReason.bad_token); raise HTTPException(status_code=401, detail="Unauthorized")
+        request.state.auth_reason = AuthFailReason.bad_token
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     p.last_seen_at = func.now()
     db.add(p); db.commit()
@@ -260,6 +249,79 @@ def require_admin(request: Request):
     if not ADMIN_TOKEN or request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+# ---------------- Middleware: log every /orders hit into auth_events ----------------
+
+@app.middleware("http")
+async def log_orders_hits(request: Request, call_next):
+    if not request.url.path.startswith("/orders"):
+        return await call_next(request)
+
+    ip = _client_ip(request)
+    ua = request.headers.get("user-agent")
+    pid = request.headers.get("x-partner-id")
+    ptok = request.headers.get("x-partner-token")
+
+    raw = await request.body()
+    raw_trunc = raw[:MAX_BODY_LOG_BYTES]
+    try:
+        body_json = json.loads(raw_trunc.decode("utf-8")) if raw_trunc else None
+    except Exception:
+        body_json = None
+
+    headers_dict = {
+        k: (v if k.lower() != "x-partner-token" else "***redacted***")
+        for k, v in request.headers.items()
+    }
+
+    # Provisional reason (covers cases FastAPI would reject before our handler)
+    reason = AuthFailReason.ok
+    if request.method.upper() == "POST":
+        if not pid:
+            reason = AuthFailReason.missing_partner_id
+        elif not ptok:
+            reason = AuthFailReason.missing_partner_token
+        elif raw and body_json is None:
+            reason = AuthFailReason.invalid_json
+
+    # Re-inject body for downstream
+    async def receive():
+        return {"type": "http.request", "body": raw, "more_body": False}
+    request._receive = receive  # type: ignore
+
+    response = await call_next(request)
+    status = getattr(response, "status_code", None)
+
+    # Prefer a precise reason set by handlers
+    final_reason = getattr(request.state, "auth_reason", None) or reason
+    if status == 429:
+        final_reason = AuthFailReason.rate_limited
+    if status and status >= 400 and final_reason == AuthFailReason.ok:
+        final_reason = AuthFailReason.unknown
+
+    db = SessionLocal()
+    try:
+        # Write a single row per /orders hit
+        from models import AuthEvent  # import here to avoid circulars
+        db.add(AuthEvent(
+            partner_id=pid,
+            ip=ip,
+            reason=final_reason,
+            user_agent=ua,
+            method=request.method,
+            path=request.url.path,
+            status_code=status,
+            headers=headers_dict,
+            body=body_json,
+            body_truncated=(len(raw) > MAX_BODY_LOG_BYTES),
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+    return response
+
 # ---------------- API ----------------
 
 @app.post("/orders")
@@ -279,26 +341,36 @@ async def create_order(
         enforce_ip_allowlist(request, getattr(partner, "allowlist_source_cidrs", None))
     except HTTPException as e:
         if e.status_code == 403:
-            db.add(AuthEvent(
-                partner_id=partner.partner_id,
-                ip=_client_ip(request),
-                reason=AuthFailReason.ip_block,
-                user_agent=request.headers.get("user-agent"),
-            ))
-            db.commit()
+            request.state.auth_reason = AuthFailReason.ip_block
         raise
 
+    # Parse JSON
     try:
         raw = await request.json()
     except Exception:
+        request.state.auth_reason = AuthFailReason.invalid_json
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     parsed = _extract_ota_payload(raw)
     ext_order_id = parsed["external_order_id"]
     if not ext_order_id:
+        request.state.auth_reason = AuthFailReason.unknown
         raise HTTPException(status_code=400, detail="order.id required")
 
-    callback_url = validate_callback_url(parsed["callback_url"], getattr(partner, "allowlist_domains", None))
+    # Validate callback URL (capture specific reasons on failure)
+    try:
+        callback_url = validate_callback_url(parsed["callback_url"], getattr(partner, "allowlist_domains", None))
+    except HTTPException as e:
+        # map details -> reasons
+        if e.detail == "callback_url must use https" or e.detail == "callback_url must use port 443" or e.detail == "callback_url required" or e.detail == "callback_url host missing":
+            request.state.auth_reason = AuthFailReason.invalid_callback_url
+        elif e.detail == "callback_url host not allowed":
+            request.state.auth_reason = AuthFailReason.callback_host_blocked
+        elif e.detail == "callback_url domain not allowed":
+            request.state.auth_reason = AuthFailReason.callback_domain_disallowed
+        else:
+            request.state.auth_reason = AuthFailReason.invalid_callback_url
+        raise
 
     ts = _ts_from_iso(parsed.get("accepted_at"))
     trace_id = f"{partner.partner_id}-{ext_order_id}-{ts}"
@@ -354,7 +426,7 @@ async def create_order(
 
     db.commit(); db.refresh(order)
 
-    # Kick ticketing in background (this will push lowerCamel payload to Soraso)
+    # Kick ticketing in background
     background.add_task(process_ticketing, order.id)
     return _order_summary(order)
 
@@ -495,13 +567,22 @@ def get_order(order_pk: int, db: Session = Depends(get_db), request: Request = N
 
 SUCCESS_STATUSES = {"fulfilled", "success", "ticketed", "ok"}
 
-# ---------- Soraso callbacks (no auth required by partner headers) ----------
+# ---------- Soraso callbacks (no partner headers) ----------
 def _check_soraso_auth(request: Request):
     token = request.headers.get("X-Callback-Token")
     if SORASO_CALLBACK_TOKEN and token != SORASO_CALLBACK_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+def enforce_ip_allowlist(request: Request, allowlist_source_cidrs: str | None) -> None:
+    cidrs = _csv_set(allowlist_source_cidrs)
+    if not cidrs:
+        return
+    ip = _client_ip(request)
+    if not _ip_in_cidrs(ip, cidrs):
+        raise HTTPException(status_code=403, detail="Source IP not allowed")
+
 def _apply_soraso_update(db: Session, o: Order, payload: dict, background: BackgroundTasks):
+    from models import FulfillmentStatus, PipelineStatus
     if o.ticketing_job:
         prev = o.ticketing_job.response_payload or {}
         merged = {**prev, **payload} if isinstance(prev, dict) and isinstance(payload, dict) else {"previous": prev, "current": payload}
@@ -586,28 +667,23 @@ async def soraso_webflow_style_callback(
     background: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    # 1) Enforce the Soraso-assigned site id from .env (hide mismatch as 404)
     if SORASO_SITE_ID and site_id != SORASO_SITE_ID:
         raise HTTPException(status_code=404, detail="site not found")
 
-    # 2) Optional shared secret header for extra safety
     if SORASO_CALLBACK_TOKEN:
         token = request.headers.get("x-callback-token", "")
         if token != SORASO_CALLBACK_TOKEN:
             raise HTTPException(status_code=403, detail="forbidden")
 
-    # 3) Soraso may POST with **empty body** (their spec)
     raw = await request.body()
     payload = None
 
-    # Try JSON first (if there is a body)
     if raw:
         try:
             payload = json.loads(raw.decode("utf-8"))
         except Exception:
             payload = None
 
-    # Fallback: form-encoded in body
     if not isinstance(payload, dict):
         try:
             qs = parse_qs(raw.decode("utf-8", "ignore"), keep_blank_values=True)
@@ -615,15 +691,11 @@ async def soraso_webflow_style_callback(
         except Exception:
             payload = {}
 
-    # Normalize fields (may be missing entirely)
     status_raw = (str(payload.get("status") or payload.get("Status") or "").strip().lower())
     fulfilled_on = payload.get("FulfilledOn") or payload.get("fulfilled_on")
-
-    # Per Soraso: empty POST means "mark fulfilled and return order json"
     if not status_raw:
         status_raw = "fulfilled"
 
-    # 4) Find latest order by external id
     o: Order | None = (
         db.query(Order)
         .filter(Order.order_id == external_order_id)
@@ -633,7 +705,6 @@ async def soraso_webflow_style_callback(
     if not o:
         raise HTTPException(status_code=404, detail="order not found")
 
-    # 5) Validate status (be forgiving)
     if status_raw not in SUCCESS_STATUSES:
         o.blocked_code = int(payload.get("code") or 400) if str(payload.get("code") or "").isdigit() else 400
         o.blocked_reason = (payload.get("message") or payload.get("error") or f"fulfillment failed (status={status_raw})")[:2000]
@@ -641,7 +712,6 @@ async def soraso_webflow_style_callback(
         db.commit()
         raise HTTPException(status_code=400, detail="unsupported status")
 
-    # 6) Mark fulfilled (idempotent)
     o.fulfillment_status = FulfillmentStatus.fulfilled
     if isinstance(fulfilled_on, str) and fulfilled_on:
         try:
@@ -651,38 +721,28 @@ async def soraso_webflow_style_callback(
     else:
         o.fulfilled_at = func.now()
 
-    # Clear any block fields
     o.blocked_code = None
     o.blocked_reason = None
     o.blocked_at = None
 
-    # Robust pipeline transition (avoid enum/runtime mismatches)
     try:
         current_status = getattr(o.pipeline_status, "value", o.pipeline_status)
         if current_status != "ticketed":
+            from models import PipelineStatus as PS
             try:
                 enum_cls = type(o.pipeline_status)
                 o.pipeline_status = enum_cls("ticketed")
             except Exception:
-                from models import PipelineStatus as PS
-                try:
-                    o.pipeline_status = PS("ticketed")
-                except Exception:
-                    pass
+                o.pipeline_status = PS("ticketed")
     except Exception:
         pass
 
     db.commit(); db.refresh(o)
 
-    # 7) Return the *inner* Soraso payload with status "fulfilled" (per your spec)
     resp = build_soraso_payload(o, status="fulfilled", wrap=False)
 
-    # 8) Trigger OTA callback ONLY if needed (avoid duplicate workers; do run when pending)
     try:
         from models import OtaCallbackJob, OtaCallbackJobStatus
-        from workers.ota_callback import process_ota_callback
-
-        # Ensure a job exists (idempotent)
         job = o.ota_callback_job
         if job is None:
             job = OtaCallbackJob(
@@ -704,7 +764,7 @@ async def soraso_webflow_style_callback(
 
     return resp
 
-# ---------- Legacy partner-protected fulfillment (optional) ----------
+# ---------- Legacy partner-protected fulfillment ----------
 @app.put("/orders/{order_pk}/fulfill")
 async def update_fulfill(
     order_pk: int,
@@ -723,6 +783,7 @@ async def update_fulfill(
         if not isinstance(payload, dict):
             raise ValueError("payload must be an object")
     except Exception:
+        request.state.auth_reason = AuthFailReason.invalid_json
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     status = (payload.get("status") or "").strip().lower()
