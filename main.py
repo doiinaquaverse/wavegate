@@ -8,12 +8,13 @@ import asyncio
 import hmac, hashlib, json
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone, timedelta
-from typing import Iterable, Set, Optional, List
+from typing import Iterable, Set, Optional, List, Any, Dict
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Depends, BackgroundTasks, Request, Body
+from fastapi import FastAPI, Header, HTTPException, Depends, BackgroundTasks, Request, Body, APIRouter
 from fastapi.responses import RedirectResponse
-from sqlalchemy import func
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from db import get_db, SessionLocal
@@ -35,6 +36,7 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 SORASO_CALLBACK_TOKEN = os.getenv("SORASO_CALLBACK_TOKEN", "").strip()
 SORASO_SITE_ID = os.getenv("SORASO_SITE_ID","").strip()
 CALLBACK_SIGNING_SECRET = os.getenv("CALLBACK_SIGNING_SECRET")
+PARTNER_FORM_TOKEN = os.getenv("PARTNER_FORM_TOKEN", "")  # <--- for /partners/registration
 
 MAX_BODY_LOG_BYTES = int(os.getenv("MAX_BODY_LOG_BYTES", "8192"))
 
@@ -47,8 +49,6 @@ TRUSTED_PROXY_CIDRS = os.getenv("TRUSTED_PROXY_CIDRS", "")
 # =====================================================================
 # MIDDLEWARE: Log EVERY hit to /orders (even if validation raises 422)
 # =====================================================================
-from sqlalchemy import text  # ensure this import exists near your other imports
-
 @app.middleware("http")
 async def log_orders_hits(request: Request, call_next):
     if not request.url.path.startswith("/orders"):
@@ -881,42 +881,83 @@ async def update_fulfill(
 
     return {**_order_summary(o), "message": "fulfillment recorded"}
 
-# ---------- Partner Registration ----------
-@app.post("/partners/register")
-async def register_partner(payload: dict, db: Session = Depends(get_db)):
-    if not isinstance(payload, dict) or not payload.get("company") or not payload.get("contactEmail"):
-        raise HTTPException(status_code=400, detail="company and contactEmail required")
+# ---------- Partner Registration (NEW, replaces old /partners/register) ----------
+
+router_partner = APIRouter(prefix="/partners", tags=["partners"])
+
+class PartnerRegistrationIn(BaseModel):
+    # Company info
+    company: Optional[str] = None
+    website: Optional[str] = None
+    country: Optional[str] = None
+    address: Optional[str] = None
+    taxId: Optional[str] = None
+    businessType: Optional[str] = None
+
+    # Business contact
+    contactName: Optional[str] = None
+    contactEmail: Optional[EmailStr] = Field(default=None)
+    contactPhone: Optional[str] = None
+
+    # Technical contact
+    techName: Optional[str] = None
+    techEmail: Optional[EmailStr] = Field(default=None)
+    techPhone: Optional[str] = None
+
+    # Integration details
+    expectedVolume: Optional[str] = None
+    rps: Optional[str] = None               # expected requests per second (string OK)
+    authMethod: Optional[str] = None
+    targetEnvironment: Optional[str] = None
+    callbackURL: Optional[str] = None
+    ipAllowlist: Optional[str] = None
+    websiteDomain: Optional[str] = None
+
+    # Raw payload from form
+    raw: Optional[Dict[str, Any]] = None
+
+@router_partner.post("/registration")
+async def create_partner_registration(
+    payload: PartnerRegistrationIn,
+    request: Request,
+    x_form_token: Optional[str] = Header(default=None, alias="X-Form-Token"),
+    db: Session = Depends(get_db),
+):
+    # shared-secret auth
+    if not PARTNER_FORM_TOKEN or x_form_token != PARTNER_FORM_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
 
     rec = PartnerRegistration(
-        reference=payload.get("reference"),
-        company=payload.get("company"),
-        website=payload.get("website"),
-        country=payload.get("country"),
-        address=payload.get("address"),
-        taxId=payload.get("taxId"),
-        contactName=payload.get("contactName"),
-        contactEmail=payload.get("contactEmail"),
-        contactPhone=payload.get("contactPhone"),
-        techName=payload.get("techName"),
-        techEmail=payload.get("techEmail"),
-        techPhone=payload.get("techPhone"),
-        vol=payload.get("vol"),
-        rps=payload.get("rps"),
-        launch=payload.get("launch"),
-        tz=payload.get("tz"),
-        desc=payload.get("desc"),
-        auth=payload.get("auth"),
-        env=payload.get("env") or "Sandbox",
-        webhook=payload.get("webhook"),
-        ips=payload.get("ips"),
-        arch=payload.get("arch"),
-        demo=payload.get("demo"),
-        usecase=payload.get("usecase") or [],
-        compliance=payload.get("compliance") or {},
-        raw=payload,
+        company=payload.company,
+        website=payload.website,
+        country=payload.country,
+        address=payload.address,
+        taxId=payload.taxId,
+        businessType=payload.businessType,
+
+        contactName=payload.contactName,
+        contactEmail=str(payload.contactEmail) if payload.contactEmail else None,
+        contactPhone=payload.contactPhone,
+
+        techName=payload.techName,
+        techEmail=str(payload.techEmail) if payload.techEmail else None,
+        techPhone=payload.techPhone,
+
+        expectedVolume=payload.expectedVolume,
+        rps=payload.rps,
+        authMethod=payload.authMethod,
+        targetEnvironment=payload.targetEnvironment,
+        callbackURL=payload.callbackURL,
+        ipAllowlist=payload.ipAllowlist,
+        websiteDomain=payload.websiteDomain,
+
+        raw=(payload.raw if payload.raw is not None else await request.json()),
     )
-    db.add(rec); db.commit()
+    db.add(rec); db.commit(); db.refresh(rec)
     return {"ok": True, "id": rec.id}
+
+# mount the router
+app.include_router(router_partner)
 
 # ---------- Debug: detected client IP ----------
 @app.get("/debug/ip")

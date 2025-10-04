@@ -321,7 +321,7 @@ class IdempotencyKey(Base):
 # ---------------- PartnerRegistration (restored) ----------------
 
 class PartnerRegistration(Base):
-    __tablename__ = "partner_registrations"
+    __tablename__ = "partners_registration"
     __table_args__ = (
         Index("ix_partner_reg_created_at", "created_at"),
         Index("ix_partner_reg_company", "company"),
@@ -329,39 +329,42 @@ class PartnerRegistration(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    reference: Mapped[Optional[str]] = mapped_column(String(200))
 
+    # Company info
     company: Mapped[Optional[str]] = mapped_column(String(255))
     website: Mapped[Optional[str]] = mapped_column(String(255))
     country: Mapped[Optional[str]] = mapped_column(String(128))
     address: Mapped[Optional[str]] = mapped_column(Text)
     taxId: Mapped[Optional[str]] = mapped_column(String(128))
+    businessType: Mapped[Optional[str]] = mapped_column(String(128))
 
+    # Business contact
     contactName: Mapped[Optional[str]] = mapped_column(String(255))
     contactEmail: Mapped[Optional[str]] = mapped_column(String(320))
     contactPhone: Mapped[Optional[str]] = mapped_column(String(64))
 
+    # Technical contact
     techName: Mapped[Optional[str]] = mapped_column(String(255))
     techEmail: Mapped[Optional[str]] = mapped_column(String(320))
     techPhone: Mapped[Optional[str]] = mapped_column(String(64))
 
-    vol: Mapped[Optional[str]] = mapped_column(String(64))
-    rps: Mapped[Optional[str]] = mapped_column(String(64))
-    launch: Mapped[Optional[str]] = mapped_column(String(64))
-    tz: Mapped[Optional[str]] = mapped_column(String(64))
-    desc: Mapped[Optional[str]] = mapped_column(Text)
-    auth: Mapped[Optional[str]] = mapped_column(String(128))
-    env: Mapped[Optional[str]] = mapped_column(String(64))
-    webhook: Mapped[Optional[str]] = mapped_column(Text)
-    ips: Mapped[Optional[str]] = mapped_column(Text)
-    arch: Mapped[Optional[str]] = mapped_column(Text)
-    demo: Mapped[Optional[str]] = mapped_column(String(64))
+    # Integration details
+    expectedVolume: Mapped[Optional[str]] = mapped_column(String(128))
+    rps: Mapped[Optional[str]] = mapped_column(String(64))            # expected requests per second
+    authMethod: Mapped[Optional[str]] = mapped_column(String(128))
+    targetEnvironment: Mapped[Optional[str]] = mapped_column(String(64))
+    callbackURL: Mapped[Optional[str]] = mapped_column(Text)
+    ipAllowlist: Mapped[Optional[str]] = mapped_column(Text)
+    websiteDomain: Mapped[Optional[str]] = mapped_column(String(255))
 
-    usecase: Mapped[Optional[dict]] = mapped_column(JSON)       # often a list[] but JSON covers it
-    compliance: Mapped[Optional[dict]] = mapped_column(JSON)
+    # Raw payload from form
     raw: Mapped[Optional[dict]] = mapped_column(JSON)
 
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    created_at: Mapped[str] = mapped_column(
+        TIMESTAMP(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
 
 # ---------------- AuthEvents ----------------
 
